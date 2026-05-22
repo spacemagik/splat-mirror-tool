@@ -278,6 +278,69 @@ export function buildMirroredSplat(splat, axis, d, flipSide = false) {
   return out;
 }
 
+/**
+ * Allocate a fresh splat-data object with the same schema as `like` but with
+ * room for `count` points. Helper for the slice/clip helpers below.
+ */
+function allocLike(like, count) {
+  const hasSh = like.sh != null && like.shCoeffsPerPoint > 0;
+  return {
+    version: like.version,
+    numPoints: count,
+    shDegree: like.shDegree,
+    fractionalBits: like.fractionalBits,
+    antialiased: like.antialiased,
+    positions: new Float32Array(count * 3),
+    alphas: new Float32Array(count),
+    rawColors: like.rawColors ? new Uint8Array(count * 3) : null,
+    colors: new Float32Array(count * 3),
+    scales: new Float32Array(count * 3),
+    rotations: new Float32Array(count * 4),
+    sh: hasSh ? new Float32Array(count * like.shCoeffsPerPoint) : null,
+    shCoeffsPerPoint: like.shCoeffsPerPoint,
+  };
+}
+
+/**
+ * Copy only the source-side splats of `splat` into a new splat. Used by the
+ * two-slot download to get "splat A's source half" without also producing
+ * mirrored twins.
+ */
+export function keepSourceSide(splat, axis, d, flipSide = false) {
+  let count = 0;
+  for (let i = 0; i < splat.numPoints; i++) {
+    if (isOnSourceSide(splat, i, axis, d, flipSide)) count++;
+  }
+  const out = allocLike(splat, count);
+  let w = 0;
+  for (let i = 0; i < splat.numPoints; i++) {
+    if (!isOnSourceSide(splat, i, axis, d, flipSide)) continue;
+    copySplat(splat, i, out, w);
+    w++;
+  }
+  return out;
+}
+
+/**
+ * Take only the splats that lie on the source side of the plane, and reflect
+ * THEM to the mirror side. Used by the two-slot download to mirror B's
+ * (or A's, if B is missing) source-side half across the plane.
+ */
+export function reflectAllSourceSide(splat, axis, d, flipSide = false) {
+  let count = 0;
+  for (let i = 0; i < splat.numPoints; i++) {
+    if (isOnSourceSide(splat, i, axis, d, flipSide)) count++;
+  }
+  const out = allocLike(splat, count);
+  let w = 0;
+  for (let i = 0; i < splat.numPoints; i++) {
+    if (!isOnSourceSide(splat, i, axis, d, flipSide)) continue;
+    reflectSplat(splat, i, out, w, axis, d);
+    w++;
+  }
+  return out;
+}
+
 function copySplat(splat, i, out, j) {
   const i3 = i * 3,
     j3 = j * 3,

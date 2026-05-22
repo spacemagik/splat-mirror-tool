@@ -297,16 +297,33 @@ button.primary:disabled {
 #drop-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.6);
   display: none;
-  align-items: center;
-  justify-content: center;
   z-index: 100;
   pointer-events: none;
 }
 
 #drop-overlay.active {
   display: flex;
+}
+
+.drop-half {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+  border: 2px dashed transparent;
+  transition: background 0.12s, border-color 0.12s;
+  pointer-events: auto;
+}
+
+.drop-half + .drop-half {
+  border-left: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.drop-half.hover {
+  background: rgba(61, 125, 255, 0.18);
+  border-color: var(--accent);
 }
 
 .drop-card {
@@ -316,4 +333,49 @@ button.primary:disabled {
   background: rgba(20, 22, 28, 0.9);
   font-size: 18px;
   font-weight: 600;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  pointer-events: none;
+}
+
+.drop-title {
+  font-size: 20px;
+  letter-spacing: 0.04em;
+}
+
+.drop-sub {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+/* Splat slot row inside the Splats accordion */
+.slot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.slot-name {
+  flex: 1;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.slot-name.loaded {
+  color: var(--text);
+}
+
+.slot button.ghost {
+  padding: 4px 8px;
+  font-size: 11px;
 }

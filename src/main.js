@@ -3,12 +3,16 @@
 // Architecture (think of it like a real bathroom mirror):
 //
 //   - The symmetry PLANE lives in world space (controlled by axis + plane slider).
-//     It is fixed; the user moves the splat in front of it.
-//   - The ORIGINAL splat lives in `splatGroup`, which is the gizmo's target.
-//     The gizmo moves/rotates the splat freely in world space.
-//   - A MIRROR copy of the splat is rendered as a separate SplatMesh whose
-//     world transform is computed every frame as:
+//     It is fixed; the user moves the splats in front of it.
+//   - SLOT A is the source-side splat — it lives in `splatGroup`, which the
+//     gizmo controls. The gizmo moves/rotates it freely in world space.
+//   - SLOT B is an optional mirror-side splat. If B is empty we render A's
+//     own pre-reflected twin on the mirror side (the original "kaleidoscope
+//     selfie" behavior). If B is loaded we render B's pre-reflected version
+//     instead — same spatial location, but a different model. This makes the
+//     two splats appear to mirror each other even though they're different.
 //
+//   - The mirror mesh's world transform is computed every frame as:
 //        T_mirror = Reflect_world  ·  T_gizmo  ·  Reflect_local
 //
 //     where Reflect_world is the reflection across the user-chosen world plane,
@@ -18,8 +22,8 @@
 //     final transform is a proper rotation + translation that Spark renders
 //     correctly.
 //
-// The download takes the gizmo-transformed splat in world space, applies the
-// usual "keep one side, mirror to the other" clip, encodes a single .spz.
+// The download bakes A on the source side and (B if loaded, else A) on the
+// mirror side into a single combined .spz that matches the preview.
 
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
@@ -42,6 +46,8 @@ import { encodeSpz } from "./spz-encode.js";
 import {
   buildMirroredSplat,
   mirrorAllSplats,
+  keepSourceSide,
+  reflectAllSourceSide,
   concatSplats,
   applyTransform,
   AXES,
@@ -156,12 +162,20 @@ scene.add(splatGroup);
 splatGroup.add(new THREE.AxesHelper(0.3));
 
 // ----- State -----
-let splatData = null; // decoded original
+// Slot A: the SOURCE-side splat (always required to render anything).
+let splatA = null; // decoded original of A
+let packedA = null; // GPU-packed copy of A used for the original mesh + radial originals
+let mirrorPackedA = null; // pre-reflected (local-X) copy of A — used as the mirror twin when no B is loaded
+let fileNameA = "splat.spz";
+
+// Slot B: an OPTIONAL second splat that replaces A's mirror twin.
+let splatB = null; // decoded splat for slot B (null if not loaded)
+let mirrorPackedB = null; // pre-reflected (local-X) copy of B — used as the mirror twin when B is loaded
+let fileNameB = null;
+
+// Meshes (recreated as needed when packs change).
 let originalMesh = null;
-let originalPacked = null;
 let mirrorMesh = null;
-let mirrorPacked = null;
-let sourceFileName = "splat.spz";
 
 // Reusable matrices (avoid per-frame allocation)
 const reflectWorld = new THREE.Matrix4();
@@ -205,6 +219,16 @@ const ui = createUI({
     splatGroup.scale.set(1, 1, 1);
   },
   onDownload: handleDownload,
+  onLoadFile: async (slot, file) => {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    try {
+      await loadSpzIntoSlot(slot, bytes, file.name);
+    } catch (err) {
+      console.error(err);
+      ui.setStatus(`Failed to load slot ${slot.toUpperCase()}: ${err.message}`, true);
+    }
+  },
+  onClearSlot: (slot) => clearSlot(slot),
 });
 
 const _vFrom = new THREE.Vector3(0, 0, 1);
@@ -338,11 +362,11 @@ function rebuildRadialMeshes(count) {
     m.dispose?.();
   }
 
-  if (!originalPacked || !mirrorPacked) return;
+  if (!packedA || !activeMirrorPacked()) return;
 
   // Add extras to reach desired count
   while (radialOriginals.length < desiredExtras) {
-    const o = new SplatMesh({ packedSplats: originalPacked });
+    const o = new SplatMesh({ packedSplats: packedA });
     o.editable = true;
     o.edits = [originalClipEdit];
     o.matrixAutoUpdate = false;
@@ -350,7 +374,7 @@ function rebuildRadialMeshes(count) {
     radialOriginals.push(o);
   }
   while (radialMirrors.length < desiredExtras) {
-    const m = new SplatMesh({ packedSplats: mirrorPacked });
+    const m = new SplatMesh({ packedSplats: activeMirrorPacked() });
     m.editable = true;
     m.edits = [mirrorClipEdit];
     m.matrixAutoUpdate = false;
@@ -402,83 +426,164 @@ async function loadSpzFromUrl(url) {
   if (!res.ok) throw new Error(`Failed to fetch ${url}: ${res.status}`);
   const buf = new Uint8Array(await res.arrayBuffer());
   const fileName = decodeURIComponent(url.split("/").pop() || "splat.spz");
-  await loadSpzFromBytes(buf, fileName);
+  await loadSpzIntoSlot("a", buf, fileName);
 }
 
-async function loadSpzFromBytes(bytes, fileName) {
-  sourceFileName = fileName;
-  ui.setStatus(`Decoding ${fileName}…`);
-  ui.enableDownload(false);
+// Return whichever pre-reflected packed splat should currently feed the
+// mirror-side mesh (and the radial mirror copies): B's if loaded, A's
+// otherwise.
+function activeMirrorPacked() {
+  return mirrorPackedB ?? mirrorPackedA;
+}
 
-  // Decode original
-  splatData = decodeSpz(bytes);
-
-  // Dispose previous meshes
+// Tear down the original mesh + any radial source-side copies (cheap helpers
+// used by the slot loaders to avoid duplicating dispose logic).
+function disposeOriginalMeshes() {
   if (originalMesh) {
     splatGroup.remove(originalMesh);
     originalMesh.dispose?.();
     originalMesh = null;
   }
-  if (mirrorMesh) {
-    scene.remove(mirrorMesh);
-    mirrorMesh.dispose?.();
-    mirrorMesh = null;
-  }
-  // Dispose any radial extras BEFORE freeing the packed buffers they reference.
   for (const m of radialOriginals) {
     scene.remove(m);
     m.dispose?.();
   }
   radialOriginals = [];
+}
+
+function disposeMirrorMeshes() {
+  if (mirrorMesh) {
+    scene.remove(mirrorMesh);
+    mirrorMesh.dispose?.();
+    mirrorMesh = null;
+  }
   for (const m of radialMirrors) {
     scene.remove(m);
     m.dispose?.();
   }
   radialMirrors = [];
-  if (originalPacked) {
-    originalPacked.dispose?.();
-    originalPacked = null;
-  }
-  if (mirrorPacked) {
-    mirrorPacked.dispose?.();
-    mirrorPacked = null;
-  }
+}
 
-  ui.setStatus(
-    `Building meshes (${splatData.numPoints.toLocaleString()} splats)…`,
-  );
-
-  // Pack the original splat data
-  originalPacked = await packFromData(splatData);
-  originalMesh = new SplatMesh({ packedSplats: originalPacked });
+// Build / rebuild the original mesh from the currently-loaded packedA.
+async function buildOriginalMesh() {
+  disposeOriginalMeshes();
+  if (!packedA) return;
+  originalMesh = new SplatMesh({ packedSplats: packedA });
   originalMesh.editable = true;
   originalMesh.edits = [originalClipEdit];
   await originalMesh.initialized;
   splatGroup.add(originalMesh);
+}
 
-  // Build the pre-reflected copy of the same data (local-X reflection) and
-  // pack it. This is the mesh we'll position through reflectWorld * gizmo * reflectLocal.
-  const mirrorData = mirrorAllSplats(splatData, 0, 0);
-  mirrorPacked = await packFromData(mirrorData);
-  mirrorMesh = new SplatMesh({ packedSplats: mirrorPacked });
+// Build / rebuild the mirror mesh from whichever pre-reflected pack is active.
+async function buildMirrorMesh() {
+  disposeMirrorMeshes();
+  const src = activeMirrorPacked();
+  if (!src) return;
+  mirrorMesh = new SplatMesh({ packedSplats: src });
   mirrorMesh.editable = true;
   mirrorMesh.edits = [mirrorClipEdit];
   mirrorMesh.matrixAutoUpdate = false; // we drive .matrix manually
   await mirrorMesh.initialized;
   scene.add(mirrorMesh);
+}
 
-  // Auto-fit plane bounds + camera to the splat extents
-  fitPlaneBoundsFromData();
+async function loadSpzIntoSlot(slot, bytes, fileName) {
+  if (slot !== "a" && slot !== "b") return;
+  ui.setStatus(`Decoding ${fileName}…`);
+  ui.enableDownload(false);
 
-  // Apply UI state once so the plane visualization and reflectWorld are in sync
-  applyUIState(ui.state);
-  // And push the mirror mesh's first transform
+  const decoded = decodeSpz(bytes);
+
+  if (slot === "a") {
+    splatA = decoded;
+    fileNameA = fileName;
+
+    // Disposing meshes BEFORE freeing the packed buffers they referenced
+    disposeOriginalMeshes();
+    disposeMirrorMeshes();
+    if (packedA) {
+      packedA.dispose?.();
+      packedA = null;
+    }
+    if (mirrorPackedA) {
+      mirrorPackedA.dispose?.();
+      mirrorPackedA = null;
+    }
+
+    ui.setStatus(
+      `Building meshes (${decoded.numPoints.toLocaleString()} splats from A)…`,
+    );
+    packedA = await packFromData(decoded);
+    mirrorPackedA = await packFromData(mirrorAllSplats(decoded, 0, 0));
+
+    await buildOriginalMesh();
+    await buildMirrorMesh();
+    fitPlaneBoundsFromData(splatA);
+  } else {
+    splatB = decoded;
+    fileNameB = fileName;
+
+    // Mirror mesh + radial mirrors will be rebuilt; dispose first
+    disposeMirrorMeshes();
+    if (mirrorPackedB) {
+      mirrorPackedB.dispose?.();
+      mirrorPackedB = null;
+    }
+
+    ui.setStatus(
+      `Building mirror-side mesh (${decoded.numPoints.toLocaleString()} splats from B)…`,
+    );
+    mirrorPackedB = await packFromData(mirrorAllSplats(decoded, 0, 0));
+    await buildMirrorMesh();
+  }
+
+  applyUIState(ui.state); // re-apply (recreates radial copies referencing new packs)
   updateMirrorTransform();
-
+  ui.setSlotName("a", splatA ? fileNameA : null);
+  ui.setSlotName("b", splatB ? fileNameB : null);
   ui.setStatus(
-    `Loaded: ${splatData.numPoints.toLocaleString()} splats from ${fileName}`,
+    `Slot ${slot.toUpperCase()} loaded: ${decoded.numPoints.toLocaleString()} splats from ${fileName}`,
   );
-  ui.enableDownload(true);
+  if (splatA) ui.enableDownload(true);
+}
+
+async function clearSlot(slot) {
+  if (slot === "a") {
+    // Clearing A unloads everything (nothing to render without a source-side splat).
+    splatA = null;
+    fileNameA = "splat.spz";
+    disposeOriginalMeshes();
+    disposeMirrorMeshes();
+    if (packedA) {
+      packedA.dispose?.();
+      packedA = null;
+    }
+    if (mirrorPackedA) {
+      mirrorPackedA.dispose?.();
+      mirrorPackedA = null;
+    }
+    // Slot B's pre-reflected buffer is still valid, but with no A there's
+    // nothing to anchor the mirror to. Keep B's data around so it reappears
+    // when the user reloads A.
+    ui.enableDownload(false);
+  } else {
+    if (!splatB) return;
+    splatB = null;
+    fileNameB = null;
+    disposeMirrorMeshes();
+    if (mirrorPackedB) {
+      mirrorPackedB.dispose?.();
+      mirrorPackedB = null;
+    }
+    // Mirror reverts to A's twin
+    await buildMirrorMesh();
+    applyUIState(ui.state);
+    updateMirrorTransform();
+  }
+  ui.setSlotName("a", splatA ? fileNameA : null);
+  ui.setSlotName("b", splatB ? fileNameB : null);
+  ui.setStatus(`Slot ${slot.toUpperCase()} cleared`);
 }
 
 function computeAabb(positions, n) {
@@ -502,7 +607,8 @@ function computeAabb(positions, n) {
   return { minX, minY, minZ, maxX, maxY, maxZ };
 }
 
-function fitPlaneBoundsFromData() {
+function fitPlaneBoundsFromData(splatForFit) {
+  const splatData = splatForFit ?? splatA;
   if (!splatData) return;
   const aabb = computeAabb(splatData.positions, splatData.numPoints);
   const extent = Math.max(
@@ -546,8 +652,17 @@ function fitPlaneBoundsFromData() {
 }
 
 // ----- Drag and drop -----
+// The overlay is split into two halves (data-slot="a" | "b"). When the user
+// drags a file over the window we show the overlay; the half they release
+// the mouse on decides which slot the file loads into.
 const dropOverlay = document.getElementById("drop-overlay");
+const dropHalves = dropOverlay.querySelectorAll(".drop-half");
 let dragDepth = 0;
+
+function clearDropHover() {
+  dropHalves.forEach((h) => h.classList.remove("hover"));
+}
+
 window.addEventListener("dragenter", (e) => {
   e.preventDefault();
   dragDepth++;
@@ -559,28 +674,44 @@ window.addEventListener("dragleave", (e) => {
   if (dragDepth <= 0) {
     dragDepth = 0;
     dropOverlay.classList.remove("active");
+    clearDropHover();
   }
 });
 window.addEventListener("dragover", (e) => {
   e.preventDefault();
 });
-window.addEventListener("drop", async (e) => {
-  e.preventDefault();
-  dragDepth = 0;
-  dropOverlay.classList.remove("active");
-  const file = e.dataTransfer?.files?.[0];
-  if (!file) return;
-  if (!file.name.toLowerCase().endsWith(".spz")) {
-    ui.setStatus("Only .spz files are supported", true);
-    return;
-  }
-  const bytes = new Uint8Array(await file.arrayBuffer());
-  try {
-    await loadSpzFromBytes(bytes, file.name);
-  } catch (err) {
-    console.error(err);
-    ui.setStatus(`Failed to load: ${err.message}`, true);
-  }
+
+dropHalves.forEach((half) => {
+  half.addEventListener("dragenter", () => {
+    clearDropHover();
+    half.classList.add("hover");
+  });
+  half.addEventListener("dragover", (e) => {
+    e.preventDefault();
+  });
+  half.addEventListener("drop", async (e) => {
+    e.preventDefault();
+    dragDepth = 0;
+    dropOverlay.classList.remove("active");
+    clearDropHover();
+    const file = e.dataTransfer?.files?.[0];
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith(".spz")) {
+      ui.setStatus("Only .spz files are supported", true);
+      return;
+    }
+    const slot = half.dataset.slot;
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    try {
+      await loadSpzIntoSlot(slot, bytes, file.name);
+    } catch (err) {
+      console.error(err);
+      ui.setStatus(
+        `Failed to load slot ${slot.toUpperCase()}: ${err.message}`,
+        true,
+      );
+    }
+  });
 });
 
 // ----- Download -----
@@ -589,7 +720,7 @@ window.addEventListener("drop", async (e) => {
 // user's chosen axis/offset/flip-side. The result is a single .spz of the
 // symmetric splat as it appears in the preview.
 async function handleDownload() {
-  if (!splatData) return;
+  if (!splatA) return;
   ui.enableDownload(false);
   ui.setStatus("Applying gizmo + mirror, encoding .spz…");
   try {
@@ -599,9 +730,22 @@ async function handleDownload() {
     const axisIdx = AXES[ui.state.axis];
     const radialCount = Math.max(1, Math.floor(ui.state.radialCount));
 
-    // Build one "wedge" (gizmo-transformed splat → clip + mirror across the
-    // user's plane) for each radial slot, then concat them. For radialCount=1
-    // this is just the existing single-wedge path.
+    // For each radial slot we bake one "wedge":
+    //   - A's source-side splats at  RotY(angle) · T_gizmo
+    //   - (B if loaded, else A)'s source-side splats reflected across the
+    //     world plane (same world transform as A's wedge, then mirrored).
+    // For radialCount=1 + no B this collapses to the original behaviour.
+    const splatForMirror = splatB ?? splatA;
+    if (
+      splatB &&
+      (splatA.shCoeffsPerPoint !== splatB.shCoeffsPerPoint ||
+        splatA.shDegree !== splatB.shDegree)
+    ) {
+      ui.setStatus(
+        `Note: A and B have different SH degrees; B will be downscaled to A's schema.`,
+      );
+    }
+
     const parts = [];
     const rotMat = new THREE.Matrix4();
     const rotQuat = new THREE.Quaternion();
@@ -613,36 +757,45 @@ async function handleDownload() {
       const angle = (i * 2 * Math.PI) / radialCount;
       rotQuat.setFromAxisAngle(Y_AXIS, angle);
       rotMat.makeRotationFromQuaternion(rotQuat);
-      // composed = RotY(angle) * splatGroup.matrixWorld
       composedMat.multiplyMatrices(rotMat, splatGroup.matrixWorld);
       composedQuat.multiplyQuaternions(rotQuat, baseQuat);
-
-      const worldSplat = cloneSplatData(splatData);
       const composedQuatArr = new Float32Array([
         composedQuat.x,
         composedQuat.y,
         composedQuat.z,
         composedQuat.w,
       ]);
-      applyTransform(
-        worldSplat,
-        composedMat.elements,
-        composedQuatArr,
+
+      // A's source-side half (world-space)
+      const worldA = cloneSplatData(splatA);
+      applyTransform(worldA, composedMat.elements, composedQuatArr);
+      parts.push(
+        keepSourceSide(worldA, axisIdx, ui.state.plane, ui.state.flipSide),
       );
 
-      const wedge = buildMirroredSplat(
-        worldSplat,
-        axisIdx,
-        ui.state.plane,
-        ui.state.flipSide,
+      // B's (or A's fallback) source-side half, reflected to the mirror side
+      const worldMirror = cloneSplatData(splatForMirror);
+      applyTransform(worldMirror, composedMat.elements, composedQuatArr);
+      parts.push(
+        reflectAllSourceSide(
+          worldMirror,
+          axisIdx,
+          ui.state.plane,
+          ui.state.flipSide,
+        ),
       );
-      parts.push(wedge);
     }
 
     const mirroredData = concatSplats(parts);
     const bytes = encodeSpz(mirroredData);
-    const baseName = sourceFileName.replace(/\.spz$/i, "");
-    const suffix = radialCount > 1 ? `-radial${radialCount}` : "-mirrored";
+    const baseName = fileNameA.replace(/\.spz$/i, "");
+    const suffix = splatB
+      ? radialCount > 1
+        ? `-AB-radial${radialCount}`
+        : "-AB"
+      : radialCount > 1
+        ? `-radial${radialCount}`
+        : "-mirrored";
     const downloadName = `${baseName}${suffix}.spz`;
     const blob = new Blob([bytes], { type: "application/octet-stream" });
     const url = URL.createObjectURL(blob);

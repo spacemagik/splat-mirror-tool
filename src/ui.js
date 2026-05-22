@@ -1,7 +1,13 @@
 // UI controller: reads the HTML controls and emits an event whenever any value
 // changes. The main app subscribes and updates the scene accordingly.
 
-export function createUI({ onChange, onDownload, onResetSplat }) {
+export function createUI({
+  onChange,
+  onDownload,
+  onResetSplat,
+  onLoadFile,
+  onClearSlot,
+}) {
   const state = {
     axis: "x", // 'x' | 'y' | 'z'
     plane: 0, // world units
@@ -151,6 +157,46 @@ export function createUI({ onChange, onDownload, onResetSplat }) {
     onDownload?.();
   });
 
+  // Splat slot UI: hidden file input shared by both slot Load buttons.
+  // We remember which slot the user clicked Load on so the input's "change"
+  // handler can route the file to the right slot.
+  const fileInput = document.getElementById("file-input");
+  let pendingSlot = null;
+  function pickFileFor(slot) {
+    pendingSlot = slot;
+    fileInput.value = ""; // allow re-picking the same file
+    fileInput.click();
+  }
+  fileInput.addEventListener("change", () => {
+    const file = fileInput.files?.[0];
+    if (file && pendingSlot) onLoadFile?.(pendingSlot, file);
+    pendingSlot = null;
+  });
+  document.getElementById("slot-a-load").addEventListener("click", () =>
+    pickFileFor("a"),
+  );
+  document.getElementById("slot-b-load").addEventListener("click", () =>
+    pickFileFor("b"),
+  );
+  document.getElementById("slot-a-clear").addEventListener("click", () =>
+    onClearSlot?.("a"),
+  );
+  document.getElementById("slot-b-clear").addEventListener("click", () =>
+    onClearSlot?.("b"),
+  );
+
+  const slotANameEl = document.getElementById("slot-a-name");
+  const slotBNameEl = document.getElementById("slot-b-name");
+  function renderSlotName(el, name) {
+    if (name) {
+      el.textContent = name;
+      el.classList.add("loaded");
+    } else {
+      el.textContent = "not loaded";
+      el.classList.remove("loaded");
+    }
+  }
+
   function emit() {
     onChange?.({ ...state });
   }
@@ -182,6 +228,9 @@ export function createUI({ onChange, onDownload, onResetSplat }) {
     },
     enableDownload(enabled) {
       document.getElementById("download").disabled = !enabled;
+    },
+    setSlotName(slot, name) {
+      renderSlotName(slot === "a" ? slotANameEl : slotBNameEl, name);
     },
   };
 }
