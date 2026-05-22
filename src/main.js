@@ -262,6 +262,7 @@ function applyUIState(state) {
   previousCameraMode = state.cameraMode;
   orbit.enabled = !fly;
   flyControls.fpsMovement.enable = fly;
+  flyControls.fpsMovement.moveSpeed = state.flySpeed;
   flyControls.pointerControls.enable = fly;
 
   // Gizmo mode — available in both orbit and fly. While flying, the

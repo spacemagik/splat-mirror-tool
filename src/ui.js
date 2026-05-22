@@ -10,6 +10,7 @@ export function createUI({ onChange, onDownload, onResetSplat }) {
     gizmoMode: "translate", // 'translate' | 'rotate' | 'off'
     softEdge: 0, // total fade width across the symmetry plane, in world units
     cameraMode: "orbit", // 'orbit' | 'fly'
+    flySpeed: 1, // base movement speed for the fly camera (Shift/Ctrl multipliers apply on top)
     radialCount: 1, // number of rotational copies around world Y (1 = none)
   };
 
@@ -119,6 +120,27 @@ export function createUI({ onChange, onDownload, onResetSplat }) {
       }
       emit();
     });
+  });
+
+  // Fly speed slider + numeric input
+  const flySlider = document.getElementById("fly-speed-slider");
+  const flyInput = document.getElementById("fly-speed-input");
+  const flyValue = document.getElementById("fly-speed-value");
+  function setFlySpeed(v, src) {
+    state.flySpeed = Math.max(0.01, v);
+    flyValue.textContent = state.flySpeed.toFixed(2);
+    if (src !== "slider") flySlider.value = String(state.flySpeed);
+    if (src !== "input") flyInput.value = state.flySpeed.toFixed(2);
+    emit();
+  }
+  flySlider.addEventListener("input", () =>
+    setFlySpeed(parseFloat(flySlider.value) || 1, "slider"),
+  );
+  flyInput.addEventListener("change", () =>
+    setFlySpeed(parseFloat(flyInput.value) || 1, "input"),
+  );
+  document.getElementById("fly-speed-reset").addEventListener("click", () => {
+    setFlySpeed(1);
   });
 
   document.getElementById("reset-splat").addEventListener("click", () => {
