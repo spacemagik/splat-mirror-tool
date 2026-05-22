@@ -6,3 +6,15 @@
 
 # Cursor workspace config (kept private, not shared on GitHub)
 .cursor/
+
+# Node / Vite
+node_modules/
+dist/
+.vite/
+*.log
+
+# .spz outputs/extras. The original Dreamlike Room .spz is already tracked
+# by the initial commit, so this rule only blocks NEW .spz files (test
+# exports, additional splats you drop in, etc.) — already-tracked files
+# stay tracked.
+*.spz

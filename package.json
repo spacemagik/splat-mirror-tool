@@ -1,0 +1,20 @@
+{
+  "name": "splat-mirror",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Drag-and-drop tool to symmetrically mirror Gaussian splats and export a new .spz",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@sparkjsdev/spark": "^2.1.0",
+    "fflate": "^0.8.2",
+    "three": "^0.180.0"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0"
+  }
+}
