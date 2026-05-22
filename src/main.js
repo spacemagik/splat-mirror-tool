@@ -354,18 +354,19 @@ function autoSyncSplatGroupBToA() {
 }
 
 // Mirror mesh's world matrix updates each frame from splatGroupB's current
-// transform. The mirror mesh's data is pre-X-reflected (mirrorAllSplats), so
-// rendering it through splatGroupB.matrixWorld · Reflect_local cancels the
-// data's pre-flip and applies splatGroupB's user transform to the original B
-// data — i.e. user manipulates B in its natural orientation.
+// transform.
+//
+// splatGroupB is set up so its matrixWorld already encodes the desired final
+// "mirror-side" transform — i.e. autoSync stores Reflect_world · splatGroupA
+// · Reflect_local in splatGroupB, which (when multiplied with the pre-X-flipped
+// mirror data) gives Reflect_world · splatGroupA · p_B in world space.
+// So mirrorMesh.matrix = splatGroupB.matrixWorld; NO extra Reflect_local here.
 function updateMirrorTransform() {
   if (!mirrorMesh) return;
   if (!splatB) autoSyncSplatGroupBToA();
   splatGroupB.updateMatrixWorld(true);
 
-  // mirrorMesh matrix = splatGroupB.matrixWorld · Reflect_local
-  tmpMatrix.copy(splatGroupB.matrixWorld).multiply(reflectLocal);
-  mirrorMesh.matrix.copy(tmpMatrix);
+  mirrorMesh.matrix.copy(splatGroupB.matrixWorld);
   mirrorMesh.matrixWorldNeedsUpdate = true;
 
   const extraCount = radialOriginals.length;
@@ -382,10 +383,11 @@ function updateMirrorTransform() {
     );
     radialOriginals[i].matrixWorldNeedsUpdate = true;
 
-    // Mirror radial copy: RotY(angle) · splatGroupB.matrixWorld · Reflect_local
-    tmpMatrix.multiplyMatrices(tmpRotY, splatGroupB.matrixWorld);
-    tmpMatrix.multiply(reflectLocal);
-    radialMirrors[i].matrix.copy(tmpMatrix);
+    // Mirror radial copy: RotY(angle) · splatGroupB.matrixWorld
+    radialMirrors[i].matrix.multiplyMatrices(
+      tmpRotY,
+      splatGroupB.matrixWorld,
+    );
     radialMirrors[i].matrixWorldNeedsUpdate = true;
   }
 }
