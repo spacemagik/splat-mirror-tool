@@ -65,6 +65,69 @@ body {
   margin-bottom: 0;
 }
 
+/* Collapsible accordion sections built on native <details>/<summary>. */
+.accordion {
+  margin-bottom: 14px;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.02);
+  overflow: hidden;
+}
+
+.accordion[open] {
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.accordion > summary {
+  list-style: none; /* Firefox / Edge */
+  cursor: pointer;
+  padding: 10px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  user-select: none;
+  transition: background 0.12s;
+}
+
+/* Hide the default disclosure triangle in WebKit/Blink */
+.accordion > summary::-webkit-details-marker {
+  display: none;
+}
+
+.accordion > summary:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+/* Custom chevron that flips when the accordion opens. */
+.accordion > summary::after {
+  content: "";
+  width: 8px;
+  height: 8px;
+  margin-left: 8px;
+  border-right: 2px solid var(--muted);
+  border-bottom: 2px solid var(--muted);
+  transform: rotate(-45deg);
+  transition: transform 0.18s ease;
+}
+
+.accordion[open] > summary::after {
+  transform: rotate(45deg);
+}
+
+.accordion-body {
+  padding: 12px 12px 4px 12px;
+  border-top: 1px solid var(--panel-border);
+}
+
+.accordion-body > .group:last-child {
+  margin-bottom: 8px;
+}
+
 .group-label {
   display: flex;
   justify-content: space-between;

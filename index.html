@@ -13,61 +13,71 @@
     <aside id="controls">
       <h1>Splat Mirror</h1>
 
-      <section class="group">
-        <label class="group-label">Symmetry axis</label>
-        <div class="axis-buttons" role="radiogroup" aria-label="Symmetry axis">
-          <button class="axis-btn active" data-axis="x">X</button>
-          <button class="axis-btn" data-axis="y">Y</button>
-          <button class="axis-btn" data-axis="z">Z</button>
+      <details class="accordion" open>
+        <summary>Splat Mirror</summary>
+        <div class="accordion-body">
+          <section class="group">
+            <label class="group-label">Symmetry axis</label>
+            <div class="axis-buttons" role="radiogroup" aria-label="Symmetry axis">
+              <button class="axis-btn active" data-axis="x">X</button>
+              <button class="axis-btn" data-axis="y">Y</button>
+              <button class="axis-btn" data-axis="z">Z</button>
+            </div>
+          </section>
+
+          <section class="group">
+            <label class="group-label" for="plane-slider">
+              Plane position
+              <span id="plane-value">0.00</span>
+            </label>
+            <input id="plane-slider" type="range" min="-5" max="5" step="0.001" value="0" />
+            <div class="row">
+              <input id="plane-input" type="number" step="0.01" value="0" />
+              <button id="plane-reset" class="ghost">Reset to 0</button>
+            </div>
+          </section>
+
+          <section class="group">
+            <label class="checkbox">
+              <input type="checkbox" id="flip-side" />
+              <span>Flip mirrored side</span>
+            </label>
+            <label class="checkbox">
+              <input type="checkbox" id="show-plane" checked />
+              <span>Show plane visualization</span>
+            </label>
+          </section>
+
+          <section class="group">
+            <label class="group-label" for="soft-edge-slider">
+              Edge softness
+              <span id="soft-edge-value">0.00</span>
+            </label>
+            <input id="soft-edge-slider" type="range" min="0" max="1" step="0.001" value="0" />
+            <div class="row">
+              <input id="soft-edge-input" type="number" step="0.01" min="0" value="0" />
+              <button id="soft-edge-reset" class="ghost">Auto</button>
+            </div>
+          </section>
         </div>
-      </section>
+      </details>
 
-      <section class="group">
-        <label class="group-label" for="plane-slider">
-          Plane position
-          <span id="plane-value">0.00</span>
-        </label>
-        <input id="plane-slider" type="range" min="-5" max="5" step="0.001" value="0" />
-        <div class="row">
-          <input id="plane-input" type="number" step="0.01" value="0" />
-          <button id="plane-reset" class="ghost">Reset to 0</button>
+      <details class="accordion">
+        <summary>Radial Symmetry</summary>
+        <div class="accordion-body">
+          <section class="group">
+            <label class="group-label" for="radial-slider">
+              Radial copies
+              <span id="radial-value">1</span>
+            </label>
+            <input id="radial-slider" type="range" min="1" max="12" step="1" value="1" />
+            <p class="hint">
+              1 = just original + mirror. Higher = kaleidoscope — copies rotate
+              around the world's vertical (Y) axis.
+            </p>
+          </section>
         </div>
-      </section>
-
-      <section class="group">
-        <label class="checkbox">
-          <input type="checkbox" id="flip-side" />
-          <span>Flip mirrored side</span>
-        </label>
-        <label class="checkbox">
-          <input type="checkbox" id="show-plane" checked />
-          <span>Show plane visualization</span>
-        </label>
-      </section>
-
-      <section class="group">
-        <label class="group-label" for="soft-edge-slider">
-          Edge softness
-          <span id="soft-edge-value">0.00</span>
-        </label>
-        <input id="soft-edge-slider" type="range" min="0" max="1" step="0.001" value="0" />
-        <div class="row">
-          <input id="soft-edge-input" type="number" step="0.01" min="0" value="0" />
-          <button id="soft-edge-reset" class="ghost">Auto</button>
-        </div>
-      </section>
-
-      <section class="group">
-        <label class="group-label" for="radial-slider">
-          Radial copies
-          <span id="radial-value">1</span>
-        </label>
-        <input id="radial-slider" type="range" min="1" max="12" step="1" value="1" />
-        <p class="hint">
-          1 = just original + mirror. Higher = kaleidoscope — copies rotate
-          around the world's vertical (Y) axis.
-        </p>
-      </section>
+      </details>
 
       <section class="group">
         <label class="group-label">Camera</label>
