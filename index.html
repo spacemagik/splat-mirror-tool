@@ -57,6 +57,16 @@
               <button id="soft-edge-reset" class="ghost">Auto</button>
             </div>
           </section>
+
+          <section class="group">
+            <label class="group-label">Gizmo</label>
+            <div class="axis-buttons" role="radiogroup" aria-label="Gizmo mode">
+              <button class="mode-btn active" data-mode="translate">Move</button>
+              <button class="mode-btn" data-mode="rotate">Rotate</button>
+              <button class="mode-btn" data-mode="off">Off</button>
+            </div>
+            <button id="reset-splat" class="ghost full">Reset splat transform</button>
+          </section>
         </div>
       </details>
 
@@ -95,16 +105,6 @@
           </section>
         </div>
       </details>
-
-      <section class="group">
-        <label class="group-label">Gizmo</label>
-        <div class="axis-buttons" role="radiogroup" aria-label="Gizmo mode">
-          <button class="mode-btn active" data-mode="translate">Move</button>
-          <button class="mode-btn" data-mode="rotate">Rotate</button>
-          <button class="mode-btn" data-mode="off">Off</button>
-        </div>
-        <button id="reset-splat" class="ghost full">Reset splat transform</button>
-      </section>
 
       <section class="group hint">
         <p>Drag a <code>.spz</code> file onto the window to load it.</p>
