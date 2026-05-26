@@ -153,6 +153,7 @@ body {
 .mode-btn,
 .cam-btn,
 .target-btn,
+.sym-btn,
 .slot-btn {
   flex: 1;
   padding: 8px 0;
@@ -170,6 +171,7 @@ body {
 .mode-btn:hover,
 .cam-btn:hover,
 .target-btn:hover:not(:disabled),
+.sym-btn:hover,
 .slot-btn:hover {
   background: rgba(255, 255, 255, 0.07);
 }
@@ -178,6 +180,7 @@ body {
 .mode-btn.active,
 .cam-btn.active,
 .target-btn.active,
+.sym-btn.active,
 .slot-btn.active {
   background: var(--accent-strong);
   border-color: var(--accent-strong);

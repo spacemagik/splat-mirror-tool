@@ -13,6 +13,10 @@ export function createUI({
     plane: 0, // world units
     flipSide: false,
     showPlane: true, // toggle the translucent plane + edges visualization
+    // 'single' = one mirror plane; 'biaxial' = two perpendicular planes (4
+    // quadrants); 'triaxial' = three perpendicular planes meeting at a single
+    // point (8 octants, point-symmetric scene)
+    symmetryMode: "single",
     gizmoMode: "translate", // 'translate' | 'rotate' | 'scale' | 'off'
     editTarget: "a", // 'a' | 'b' — which splat the gizmo controls
     softEdge: 0, // total fade width across the symmetry plane, in world units
@@ -33,6 +37,9 @@ export function createUI({
       axisBtns.forEach((b) => b.classList.remove("active"));
       btn.classList.add("active");
       state.axis = btn.dataset.axis;
+      // The symmetry-mode hint shows which secondary/tertiary axes were
+      // auto-picked; those depend on the primary axis, so refresh it.
+      updateSymHint();
       emit();
     });
   });
@@ -71,6 +78,56 @@ export function createUI({
     state.showPlane = showPlaneCheckbox.checked;
     emit();
   });
+
+  // Symmetry-mode buttons. Tri-state radio: Single / Biaxial / Triaxial.
+  //   - Single   = one mirror plane (the existing axis selector)
+  //   - Biaxial  = a second perpendicular plane → 4 quadrants
+  //   - Triaxial = a third perpendicular plane → 8 octants (point-symmetric)
+  // The hint below the buttons explains which secondary/tertiary axes were
+  // auto-picked given the primary axis.
+  const symBtns = document.querySelectorAll(".sym-btn");
+  const symHint = document.getElementById("sym-hint");
+
+  // Returns { secondary, tertiary } axis NAMES (e.g. 'X','Y','Z') given the
+  // current primary axis. We always pick perpendicular axes: the secondary
+  // is the next horizontal one (so the up-axis stays free when possible),
+  // and the tertiary is whichever one is left over.
+  function pickPerpendicularAxes(primary) {
+    const all = ["X", "Y", "Z"];
+    const p = primary.toUpperCase();
+    let secondary;
+    if (p === "X") secondary = "Z";
+    else if (p === "Y") secondary = "X";
+    else secondary = "X"; // primary Z → secondary X
+    const tertiary = all.find((a) => a !== p && a !== secondary);
+    return { secondary, tertiary };
+  }
+
+  function updateSymHint() {
+    const { secondary, tertiary } = pickPerpendicularAxes(state.axis);
+    let text;
+    if (state.symmetryMode === "single") {
+      text = "<strong>Single</strong>: one mirror plane (the primary axis).";
+    } else if (state.symmetryMode === "biaxial") {
+      text = `<strong>Biaxial</strong>: two perpendicular planes → 4 quadrants. Secondary axis: <strong>${secondary}</strong>.`;
+    } else {
+      text = `<strong>Triaxial</strong>: three perpendicular planes meeting at one point → 8 octants (point-symmetric). Secondary: <strong>${secondary}</strong>, tertiary: <strong>${tertiary}</strong>.`;
+    }
+    symHint.innerHTML = text;
+  }
+
+  symBtns.forEach((btn) => {
+    btn.addEventListener("click", () => {
+      symBtns.forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      state.symmetryMode = btn.dataset.sym;
+      updateSymHint();
+      emit();
+    });
+  });
+
+  // Render the hint once on boot so it matches the default state.
+  updateSymHint();
 
   // Edge softness slider + numeric input
   const softSlider = document.getElementById("soft-edge-slider");

@@ -74,6 +74,18 @@
           </section>
 
           <section class="group">
+            <label class="group-label">Symmetry mode</label>
+            <div class="axis-buttons" role="radiogroup" aria-label="Symmetry mode">
+              <button class="sym-btn active" data-sym="single">Single</button>
+              <button class="sym-btn" data-sym="biaxial">Biaxial</button>
+              <button class="sym-btn" data-sym="triaxial">Triaxial</button>
+            </div>
+            <p class="hint" id="sym-hint">
+              <strong>Single</strong>: one mirror plane (the primary axis).
+            </p>
+          </section>
+
+          <section class="group">
             <label class="group-label" for="soft-edge-slider">
               Edge softness
               <span id="soft-edge-value">0.00</span>

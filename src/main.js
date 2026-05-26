@@ -65,11 +65,28 @@ const renderer = new THREE.WebGLRenderer({
   antialias: false,
   powerPreference: "high-performance",
 });
-// Cap pixel ratio at 1.5: splat rendering is fragment-bound, and DPR 2 on a
-// retina display means rendering 4x the pixels of a 1x display for very
-// little perceptual gain on splats (the per-splat gaussian already softens
-// edges). 1.5 keeps text/UI crisp without doubling the splat fill cost.
+// Cap pixel ratio at 1.5 in single mode: splat rendering is fragment-bound,
+// and DPR 2 on a retina display means rendering 4x the pixels of a 1x display
+// for very little perceptual gain on splats (the per-splat gaussian already
+// softens edges). In biaxial / triaxial mode we drop the cap further (see
+// updatePixelRatioForMode), because each pixel is now shaded by 4 or 8
+// overlapping mesh draws and fragment work is the bottleneck.
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+
+// Lower the pixel ratio as more octant meshes are active. The split is rough
+// but matches roughly the increase in per-pixel fragment work:
+//   single   → 2 meshes drawing splats, cap at 1.5
+//   biaxial  → 4 meshes (≈2x more fragment work), cap at 1.2
+//   triaxial → 8 meshes (≈4x more fragment work), cap at 1.0
+// Going below 1.0 looks too soft, so we floor there.
+function updatePixelRatioForMode(mode) {
+  const cap = mode === "triaxial" ? 1.0 : mode === "biaxial" ? 1.2 : 1.5;
+  const target = Math.min(window.devicePixelRatio, cap);
+  if (Math.abs(renderer.getPixelRatio() - target) > 1e-3) {
+    renderer.setPixelRatio(target);
+    renderer.setSize(window.innerWidth, window.innerHeight, false);
+  }
+}
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setClearColor(0x0b0c10, 1);
 
@@ -110,6 +127,10 @@ let previousCameraMode = "orbit";
 const _camForward = new THREE.Vector3();
 
 // ----- Plane visualization (world space, NOT parented to the splat) -----
+// Two planes: primary (always shown when state.showPlane is on) and secondary
+// (shown only when biaxial mode is on AND state.showPlane is on). They're
+// rendered as translucent quads with edge lines so the user can see exactly
+// where each mirror plane lives.
 const planeGroup = new THREE.Group();
 scene.add(planeGroup);
 
@@ -130,6 +151,54 @@ let planeEdges = new THREE.LineSegments(
   new THREE.LineBasicMaterial({ color: 0x6ea8ff }),
 );
 planeGroup.add(planeEdges);
+
+// Secondary plane visualization, used in biaxial AND triaxial modes. Tinted
+// differently from the primary plane so the user can tell them apart at a glance.
+const planeGroup2 = new THREE.Group();
+planeGroup2.visible = false;
+scene.add(planeGroup2);
+
+let planeMesh2 = new THREE.Mesh(
+  new THREE.PlaneGeometry(4, 4),
+  new THREE.MeshBasicMaterial({
+    color: 0xffa566,
+    transparent: true,
+    opacity: 0.18,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  }),
+);
+planeGroup2.add(planeMesh2);
+
+let planeEdges2 = new THREE.LineSegments(
+  new THREE.EdgesGeometry(planeMesh2.geometry),
+  new THREE.LineBasicMaterial({ color: 0xffa566 }),
+);
+planeGroup2.add(planeEdges2);
+
+// Tertiary plane visualization, used only in triaxial mode. Third color
+// (green) so all three planes are visually distinguishable.
+const planeGroup3 = new THREE.Group();
+planeGroup3.visible = false;
+scene.add(planeGroup3);
+
+let planeMesh3 = new THREE.Mesh(
+  new THREE.PlaneGeometry(4, 4),
+  new THREE.MeshBasicMaterial({
+    color: 0x66ff9a,
+    transparent: true,
+    opacity: 0.18,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  }),
+);
+planeGroup3.add(planeMesh3);
+
+let planeEdges3 = new THREE.LineSegments(
+  new THREE.EdgesGeometry(planeMesh3.geometry),
+  new THREE.LineBasicMaterial({ color: 0x66ff9a }),
+);
+planeGroup3.add(planeEdges3);
 
 // ----- Symmetry-plane SDF (used to clip both meshes at the plane) -----
 // One SDF object lives in the scene at the symmetry plane's world transform.
@@ -165,6 +234,62 @@ const mirrorClipEdit = new SplatEdit({
   sdfs: [clipSdf],
 });
 
+// ----- Secondary symmetry plane (biaxial mode only) -----
+// A second axis-aligned plane perpendicular to the primary one, used to cut
+// the scene into four mirrored quadrants. The two edits below mirror the
+// pattern of the primary ones (hide-mirror-side / hide-source-side) but on
+// the secondary SDF. When biaxial mode is off, no mesh references these
+// edits, so the SDF is effectively inert.
+const clipSdf2 = new SplatEditSdf({
+  type: SplatEditSdfType.PLANE,
+  opacity: 0,
+  color: new THREE.Color(1, 1, 1),
+});
+scene.add(clipSdf2);
+
+const secondaryHideMirrorEdit = new SplatEdit({
+  rgbaBlendMode: SplatEditRgbaBlendMode.MULTIPLY,
+  softEdge: DEFAULT_SOFT_EDGE,
+  sdfSmooth: 0,
+  invert: false, // hide splats on the secondary plane's MIRROR side
+  sdfs: [clipSdf2],
+});
+
+const secondaryHideSourceEdit = new SplatEdit({
+  rgbaBlendMode: SplatEditRgbaBlendMode.MULTIPLY,
+  softEdge: DEFAULT_SOFT_EDGE,
+  sdfSmooth: 0,
+  invert: true, // hide splats on the secondary plane's SOURCE side
+  sdfs: [clipSdf2],
+});
+
+// ----- Tertiary symmetry plane (triaxial mode only) -----
+// A third plane perpendicular to BOTH plane 1 and plane 2. All three pass
+// through the world origin, so they meet at a single point — the splat
+// becomes point-symmetric about that origin.
+const clipSdf3 = new SplatEditSdf({
+  type: SplatEditSdfType.PLANE,
+  opacity: 0,
+  color: new THREE.Color(1, 1, 1),
+});
+scene.add(clipSdf3);
+
+const tertiaryHideMirrorEdit = new SplatEdit({
+  rgbaBlendMode: SplatEditRgbaBlendMode.MULTIPLY,
+  softEdge: DEFAULT_SOFT_EDGE,
+  sdfSmooth: 0,
+  invert: false, // hide splats on the tertiary plane's MIRROR side
+  sdfs: [clipSdf3],
+});
+
+const tertiaryHideSourceEdit = new SplatEdit({
+  rgbaBlendMode: SplatEditRgbaBlendMode.MULTIPLY,
+  softEdge: DEFAULT_SOFT_EDGE,
+  sdfSmooth: 0,
+  invert: true, // hide splats on the tertiary plane's SOURCE side
+  sdfs: [clipSdf3],
+});
+
 // ----- Splat groups (gizmo targets) -----
 // splatGroupA owns the SOURCE-side mesh (originalMesh).
 const splatGroupA = new THREE.Group();
@@ -190,14 +315,44 @@ let mirrorBytesB = null; // re-encoded .spz bytes for B's pre-reflected twin
 let fileNameB = null;
 
 // Meshes (recreated as needed when slot data changes).
-let originalMesh = null;
-let mirrorMesh = null;
+//
+// Naming uses three sign letters indicating which side of each plane the
+// mesh occupies, where '+' = source side of that plane and '-' = mirror side:
+//
+//   mesh_ppp  ↔ originalMesh   — quadrant (++) in biaxial, octant (+++) in triaxial
+//   mesh_mpp  ↔ mirrorMesh     — quadrant (-+) / octant (-++)
+//   mesh_pmp  ↔ secondaryMesh  — quadrant (+-) / octant (+-+)   (biaxial+ only)
+//   mesh_mmp  ↔ diagonalMesh   — quadrant (--) / octant (--+)   (biaxial+ only)
+//   mesh_ppm                   — octant (++-)   (triaxial only)
+//   mesh_mpm                   — octant (-+-)   (triaxial only)
+//   mesh_pmm                   — octant (+--)   (triaxial only)
+//   mesh_mmm                   — octant (---)   (triaxial only, point inversion)
+//
+// "Even-parity" octants (those with an even number of '-' signs) use the
+// ORIGINAL packedSplats data and a world matrix with det = +1. "Odd-parity"
+// octants use the pre-X-flipped data with a world matrix that, combined with
+// the data's bake-in flip, gives the desired reflection. See updateMirrorTransform
+// for the matrix formulas.
+let originalMesh = null;   // ppp
+let mirrorMesh = null;     // mpp
+let secondaryMesh = null;  // pmp  (biaxial / triaxial)
+let diagonalMesh = null;   // mmp  (biaxial / triaxial)
+let mesh_ppm = null;       // triaxial only
+let mesh_mpm = null;       // triaxial only
+let mesh_pmm = null;       // triaxial only
+let mesh_mmm = null;       // triaxial only — point inversion
 
 // Reusable matrices (avoid per-frame allocation)
 const reflectWorld = new THREE.Matrix4();
+const reflectWorld2 = new THREE.Matrix4(); // biaxial+ mode: reflection across the secondary plane
+const reflectWorld3 = new THREE.Matrix4(); // triaxial mode: reflection across the tertiary plane
 const reflectLocal = new THREE.Matrix4().makeScale(-1, 1, 1); // local-X flip
 const tmpMatrix = new THREE.Matrix4();
 const tmpRotY = new THREE.Matrix4();
+// Scratch matrices for biaxial/triaxial per-frame transform math
+const _tmpMatA = new THREE.Matrix4();
+const _tmpMatB = new THREE.Matrix4();
+const _tmpMatC = new THREE.Matrix4();
 
 // Extra rotated copies for the kaleidoscope effect. The primary pair lives in
 // splatGroup + mirrorMesh; these arrays hold copies 1..(radialCount-1), each
@@ -256,6 +411,12 @@ const _q = new THREE.Quaternion();
 
 function applyUIState(state) {
   const axisIdx = AXES[state.axis];
+  // Auto-pick perpendicular axes for biaxial/triaxial modes. Secondary is
+  // the "next horizontal" (X→Z, Y/Z→X) so the vertical Y axis is left free
+  // when possible. Tertiary is whichever axis isn't primary or secondary.
+  const axisIdx2 = axisIdx === 0 ? 2 : 0;
+  const axisIdx3 = 3 - axisIdx - axisIdx2; // the remaining axis (0+1+2 = 3)
+  const mode = state.symmetryMode; // 'single' | 'biaxial' | 'triaxial'
 
   // Position the plane visual in WORLD space — fixed, independent of the splat
   planeGroup.position.set(0, 0, 0);
@@ -279,16 +440,70 @@ function applyUIState(state) {
   clipSdf.quaternion.copy(_q);
   clipSdf.updateMatrixWorld();
 
-  // Recompute the world-space reflection matrix for the chosen axis + offset
-  computeReflectWorld(axisIdx, state.plane);
+  // Secondary plane + SDF (used by biaxial and triaxial). Always anchored at
+  // the world origin — no separate slider yet.
+  planeGroup2.position.set(0, 0, 0);
+  _vTo.set(0, 0, 0);
+  _vTo.setComponent(axisIdx2, 1);
+  _q.setFromUnitVectors(_vFrom, _vTo);
+  planeGroup2.quaternion.copy(_q);
+  planeGroup2.visible = state.showPlane && mode !== "single";
 
-  // Push the current softness to both edits (cheap; just reassigns a number)
+  clipSdf2.position.set(0, 0, 0);
+  _vTo.set(0, 0, 0);
+  _vTo.setComponent(axisIdx2, 1);
+  _q.setFromUnitVectors(_vFrom, _vTo);
+  clipSdf2.quaternion.copy(_q);
+  clipSdf2.updateMatrixWorld();
+
+  // Tertiary plane + SDF (triaxial only)
+  planeGroup3.position.set(0, 0, 0);
+  _vTo.set(0, 0, 0);
+  _vTo.setComponent(axisIdx3, 1);
+  _q.setFromUnitVectors(_vFrom, _vTo);
+  planeGroup3.quaternion.copy(_q);
+  planeGroup3.visible = state.showPlane && mode === "triaxial";
+
+  clipSdf3.position.set(0, 0, 0);
+  _vTo.set(0, 0, 0);
+  _vTo.setComponent(axisIdx3, 1);
+  _q.setFromUnitVectors(_vFrom, _vTo);
+  clipSdf3.quaternion.copy(_q);
+  clipSdf3.updateMatrixWorld();
+
+  // Recompute the world-space reflection matrices for all three planes
+  computeReflectWorld(axisIdx, state.plane);
+  computeReflectWorld2(axisIdx2, 0); // secondary always at offset 0 in V1
+  computeReflectWorld3(axisIdx3, 0); // tertiary always at offset 0 in V1
+
+  // Push the current softness to all edits (cheap; just reassigns a number).
+  // Biaxial mode adds two more edits per mesh, triaxial adds four more, so
+  // we keep all six in sync.
   originalClipEdit.softEdge = state.softEdge;
   mirrorClipEdit.softEdge = state.softEdge;
+  secondaryHideMirrorEdit.softEdge = state.softEdge;
+  secondaryHideSourceEdit.softEdge = state.softEdge;
+  tertiaryHideMirrorEdit.softEdge = state.softEdge;
+  tertiaryHideSourceEdit.softEdge = state.softEdge;
+
+  // Scale down the WebGL pixel ratio as more octant meshes come online —
+  // each additional mesh roughly doubles fragment work for overlapping splats.
+  updatePixelRatioForMode(mode);
+
+  // Attach/detach the extra meshes for the chosen symmetry mode and rewrite
+  // each mesh's edits array to match the appropriate octant clipping.
+  applySymmetryMode(mode);
 
   // Match the radial-copy count to the slider. Cheap if the count hasn't
   // changed (the helper does nothing in that case).
   rebuildRadialMeshes(state.radialCount);
+
+  // Seed the new biaxial/triaxial meshes with their correct world matrices
+  // BEFORE the next render. updateMirrorTransform() also runs each frame
+  // from the animation loop; calling it here just avoids a one-frame flash
+  // when a mode toggle creates a fresh mesh (which would otherwise render
+  // at identity for one frame).
+  updateMirrorTransform();
 
   // Camera mode: orbit (point-and-orbit around target) or fly (free WASD + mouse-drag).
   // In fly mode we disable the gizmo so the canvas mouse drag controls the camera
@@ -341,6 +556,129 @@ function computeReflectWorld(axisIdx, offset) {
   e[12 + axisIdx] = 2 * offset;
 }
 
+// Same shape as computeReflectWorld but writes into the secondary
+// reflection matrix used for biaxial/triaxial modes.
+function computeReflectWorld2(axisIdx, offset) {
+  reflectWorld2.identity();
+  const e = reflectWorld2.elements;
+  e[axisIdx * 5] = -1;
+  e[12 + axisIdx] = 2 * offset;
+}
+
+function computeReflectWorld3(axisIdx, offset) {
+  reflectWorld3.identity();
+  const e = reflectWorld3.elements;
+  e[axisIdx * 5] = -1;
+  e[12 + axisIdx] = 2 * offset;
+}
+
+// Helper: ensure an octant mesh slot is in the right state — exists & has
+// the requested edits when `wantMesh` is true, or torn down when it's false.
+//
+// We always (re)assign `slot.edits` here, even if the mesh already existed,
+// because the edit list for a given quadrant/octant CHANGES with the symmetry
+// mode. For example, originalMesh's edits go from `[primary]` in single mode
+// to `[primary, secondaryHideMirror]` in biaxial to `[primary, sec, tert]` in
+// triaxial — same mesh, different clip combination.
+//
+// Setting `mesh.edits` BEFORE adding to the scene avoids a one-frame window
+// where Spark sees `editable=true` + `edits=null`, falls back to its child-
+// traversal path, and ends up with a different edits buffer layout than the
+// next frame uses. That layout swap is what was causing the splats to flash
+// out when flipping between modes — Spark would rebuild the shader generator
+// for the wrong edit-count and the mesh would skip a render.
+function configureMesh(slot, wantMesh, sourceMesh, edits) {
+  if (wantMesh) {
+    if (!slot) {
+      if (!sourceMesh?.packedSplats) return null;
+      // CRITICAL: When we create a new SplatMesh by sharing another mesh's
+      // packedSplats, Spark's constructor OVERWRITES the shared object's
+      // `.splatEncoding` with DEFAULT_SPLAT_ENCODING unless we explicitly
+      // pass the source's encoding through. That overwrite corrupts the
+      // original .spz quantization parameters (scale range etc.) on the
+      // shared buffer, and every mesh referencing it then decodes splats
+      // at the wrong positions/scales — which looked exactly like "the
+      // splats disappear when I flip symmetry modes".
+      slot = new SplatMesh({
+        packedSplats: sourceMesh.packedSplats,
+        splatEncoding: sourceMesh.packedSplats.splatEncoding,
+      });
+      slot.editable = true;
+      slot.edits = edits; // assign BEFORE scene.add so spark sees them on its first frameUpdate
+      slot.matrixAutoUpdate = false;
+      slot.matrix.identity(); // updateMirrorTransform() will overwrite this same frame
+      // Performance: the extra octant meshes drop view-dependent SH lighting
+      // (the spherical-harmonics coefficients past the DC term). At 8 meshes
+      // for triaxial mode, SH evaluation dominates the fragment shader. The
+      // visual difference on a mirrored copy is very subtle because reflected
+      // SH coefficients already partially break view consistency.
+      slot.maxSh = 0;
+      scene.add(slot);
+    } else {
+      slot.edits = edits;
+    }
+    return slot;
+  }
+  // wantMesh === false: dispose if present
+  if (slot) {
+    scene.remove(slot);
+    slot.dispose?.();
+  }
+  return null;
+}
+
+// Switch the scene between single-plane (2 meshes), biaxial (4 meshes), and
+// triaxial (8 meshes). Each octant gets clipped by its specific combination
+// of plane half-spaces — multiple SplatEdit items on one mesh AND together
+// because they each multiply alpha by 0 in their half-space.
+//
+//   mesh_ppp (originalMesh): [hide-mirror-P1, hide-mirror-P2 (biax+), hide-mirror-P3 (tri)]
+//   mesh_mpp (mirrorMesh)  : [hide-source-P1, hide-mirror-P2 (biax+), hide-mirror-P3 (tri)]
+//   mesh_pmp (secondary)   : [hide-mirror-P1, hide-source-P2,         hide-mirror-P3 (tri)]
+//   mesh_mmp (diagonal)    : [hide-source-P1, hide-source-P2,         hide-mirror-P3 (tri)]
+//   mesh_ppm (triax only)  : [hide-mirror-P1, hide-mirror-P2,         hide-source-P3]
+//   mesh_mpm (triax only)  : [hide-source-P1, hide-mirror-P2,         hide-source-P3]
+//   mesh_pmm (triax only)  : [hide-mirror-P1, hide-source-P2,         hide-source-P3]
+//   mesh_mmm (triax only)  : [hide-source-P1, hide-source-P2,         hide-source-P3]
+//
+// (Where "source-P_i" / "mirror-P_i" refer to the source/mirror side of plane i.)
+//
+// Octant transforms — see updateMirrorTransform for the matrix formulas.
+function applySymmetryMode(mode) {
+  const biaxial = mode === "biaxial" || mode === "triaxial";
+  const triaxial = mode === "triaxial";
+
+  // Build all eight edit-lists up front. The variable `biaxial` is captured
+  // in the closure so the helper knows which clips to include.
+  const editsFor = (sign1, sign2, sign3) => {
+    const list = [];
+    list.push(sign1 === "+" ? originalClipEdit : mirrorClipEdit);
+    if (biaxial)
+      list.push(sign2 === "+" ? secondaryHideMirrorEdit : secondaryHideSourceEdit);
+    if (triaxial)
+      list.push(sign3 === "+" ? tertiaryHideMirrorEdit : tertiaryHideSourceEdit);
+    return list;
+  };
+
+  // Primary pair is always present (as long as A is loaded), so we just
+  // rewrite their edits in place. In single mode this collapses to a single
+  // clip per mesh; biaxial adds a secondary clip, triaxial adds a tertiary.
+  if (originalMesh) originalMesh.edits = editsFor("+", "+", "+");
+  if (mirrorMesh) mirrorMesh.edits = editsFor("-", "+", "+");
+
+  // Biaxial pair: needed in biaxial AND triaxial. Odd-parity octants (1 or 3
+  // minuses) share the X-flipped pack with mirrorMesh; even-parity (0 or 2
+  // minuses) share originalMesh's pack.
+  secondaryMesh = configureMesh(secondaryMesh, biaxial, mirrorMesh, editsFor("+", "-", "+"));
+  diagonalMesh = configureMesh(diagonalMesh, biaxial, originalMesh, editsFor("-", "-", "+"));
+
+  // Triaxial-only extras (four more octants).
+  mesh_ppm = configureMesh(mesh_ppm, triaxial, mirrorMesh, editsFor("+", "+", "-"));
+  mesh_mpm = configureMesh(mesh_mpm, triaxial, originalMesh, editsFor("-", "+", "-"));
+  mesh_pmm = configureMesh(mesh_pmm, triaxial, originalMesh, editsFor("+", "-", "-"));
+  mesh_mmm = configureMesh(mesh_mmm, triaxial, mirrorMesh, editsFor("-", "-", "-"));
+}
+
 // When slot B is empty, splatGroupB auto-tracks the mirror of A so the
 // mirror-side mesh follows A's gizmo (original single-splat behaviour).
 // The matrix being decomposed has det = +1 (two reflections cancel), so it
@@ -375,6 +713,70 @@ function updateMirrorTransform() {
 
   mirrorMesh.matrix.copy(splatGroupB.matrixWorld);
   mirrorMesh.matrixWorldNeedsUpdate = true;
+
+  // Biaxial / triaxial: drive the extra meshes' world matrices.
+  //
+  // For an octant with signs (s1, s2, s3) where '-' = mirror across that
+  // plane, the effective transform on the ORIGINAL splat positions is:
+  //
+  //   T_octant = [Reflect_p1 if s1=-]
+  //            · [Reflect_p2 if s2=-]
+  //            · [Reflect_p3 if s3=-]
+  //            · splatGroupA.matrixWorld
+  //
+  // That T has det = (-1)^k · det(M_A) where k = number of minus signs.
+  // Three.js / Spark expect a det = +1 mesh matrix to render correctly, so:
+  //   - Even-k (0 or 2 minuses): T already has det = +1 → use ORIGINAL data,
+  //     and mesh.matrix = T.
+  //   - Odd-k (1 or 3 minuses): T has det = -1. We instead use the pre-X-
+  //     flipped data (mirrorMesh.packedSplats) and set mesh.matrix = T · X_flip.
+  //     Then mesh.matrix · X_flipped_data = T · X_flip · X_flip · data = T · data,
+  //     and mesh.matrix has det = (-1)·(-1) = +1 → renders fine.
+  if (secondaryMesh || diagonalMesh || mesh_ppm || mesh_mpm || mesh_pmm || mesh_mmm) {
+    splatGroupA.updateMatrixWorld(true);
+  }
+  if (secondaryMesh) {
+    // (+-+): 1 minus (P2) — odd parity, X-flipped data
+    _tmpMatA.multiplyMatrices(reflectWorld2, splatGroupA.matrixWorld);
+    secondaryMesh.matrix.multiplyMatrices(_tmpMatA, reflectLocal);
+    secondaryMesh.matrixWorldNeedsUpdate = true;
+  }
+  if (diagonalMesh) {
+    // (--+): 2 minuses (P1, P2) — even parity, original data
+    _tmpMatB.multiplyMatrices(reflectWorld, reflectWorld2);
+    diagonalMesh.matrix.multiplyMatrices(_tmpMatB, splatGroupA.matrixWorld);
+    diagonalMesh.matrixWorldNeedsUpdate = true;
+  }
+  if (mesh_ppm) {
+    // (++-): 1 minus (P3) — odd parity, X-flipped data
+    _tmpMatA.multiplyMatrices(reflectWorld3, splatGroupA.matrixWorld);
+    mesh_ppm.matrix.multiplyMatrices(_tmpMatA, reflectLocal);
+    mesh_ppm.matrixWorldNeedsUpdate = true;
+  }
+  if (mesh_mpm) {
+    // (-+-): 2 minuses (P1, P3) — even parity, original data
+    _tmpMatB.multiplyMatrices(reflectWorld, reflectWorld3);
+    mesh_mpm.matrix.multiplyMatrices(_tmpMatB, splatGroupA.matrixWorld);
+    mesh_mpm.matrixWorldNeedsUpdate = true;
+  }
+  if (mesh_pmm) {
+    // (+--): 2 minuses (P2, P3) — even parity, original data
+    _tmpMatB.multiplyMatrices(reflectWorld2, reflectWorld3);
+    mesh_pmm.matrix.multiplyMatrices(_tmpMatB, splatGroupA.matrixWorld);
+    mesh_pmm.matrixWorldNeedsUpdate = true;
+  }
+  if (mesh_mmm) {
+    // (---): 3 minuses — odd parity, X-flipped data.
+    // T = Reflect_p1 · Reflect_p2 · Reflect_p3 · M_A · X_flip.
+    // When all three planes pass through the origin, the triple reflection
+    // is point inversion (−I), so the rendered output is the splat flipped
+    // through the world origin.
+    _tmpMatA.multiplyMatrices(reflectWorld, reflectWorld2);
+    _tmpMatB.multiplyMatrices(_tmpMatA, reflectWorld3);
+    _tmpMatC.multiplyMatrices(_tmpMatB, splatGroupA.matrixWorld);
+    mesh_mmm.matrix.multiplyMatrices(_tmpMatC, reflectLocal);
+    mesh_mmm.matrixWorldNeedsUpdate = true;
+  }
 
   const extraCount = radialOriginals.length;
   if (extraCount === 0) return;
@@ -424,20 +826,35 @@ function rebuildRadialMeshes(count) {
   const mirrorPacked = mirrorMesh?.packedSplats;
   if (!srcPacked || !mirrorPacked) return;
 
-  // Add extras to reach desired count
+  // Add extras to reach desired count. Same SH=0 trick as the biaxial/triaxial
+  // extras — kaleidoscope copies are usually further from the camera and
+  // their view-dependent shading is the first thing the eye lets go of.
+  //
+  // We pass `splatEncoding` through explicitly here too — see configureMesh
+  // for the long explanation. tl;dr: without it Spark blows away the .spz's
+  // own quantization parameters on the shared packedSplats and everything
+  // decodes wrong.
   while (radialOriginals.length < desiredExtras) {
-    const o = new SplatMesh({ packedSplats: srcPacked });
+    const o = new SplatMesh({
+      packedSplats: srcPacked,
+      splatEncoding: srcPacked.splatEncoding,
+    });
     o.editable = true;
     o.edits = [originalClipEdit];
     o.matrixAutoUpdate = false;
+    o.maxSh = 0;
     scene.add(o);
     radialOriginals.push(o);
   }
   while (radialMirrors.length < desiredExtras) {
-    const m = new SplatMesh({ packedSplats: mirrorPacked });
+    const m = new SplatMesh({
+      packedSplats: mirrorPacked,
+      splatEncoding: mirrorPacked.splatEncoding,
+    });
     m.editable = true;
     m.edits = [mirrorClipEdit];
     m.matrixAutoUpdate = false;
+    m.maxSh = 0;
     scene.add(m);
     radialMirrors.push(m);
   }
@@ -475,7 +892,9 @@ function activeMirrorBytes() {
   return mirrorBytesB ?? mirrorBytesA;
 }
 
-// Tear down the original mesh + any radial source-side copies.
+// Tear down the original mesh + any radial source-side copies. Also tears
+// down the biaxial/triaxial extras that share originalMesh's packedSplats
+// (diagonalMesh, mesh_mpm, mesh_pmm).
 function disposeOriginalMeshes() {
   if (originalMesh) {
     splatGroupA.remove(originalMesh);
@@ -487,8 +906,26 @@ function disposeOriginalMeshes() {
     m.dispose?.();
   }
   radialOriginals = [];
+  if (diagonalMesh) {
+    scene.remove(diagonalMesh);
+    diagonalMesh.dispose?.();
+    diagonalMesh = null;
+  }
+  if (mesh_mpm) {
+    scene.remove(mesh_mpm);
+    mesh_mpm.dispose?.();
+    mesh_mpm = null;
+  }
+  if (mesh_pmm) {
+    scene.remove(mesh_pmm);
+    mesh_pmm.dispose?.();
+    mesh_pmm = null;
+  }
 }
 
+// Tear down the mirror mesh + any radial mirror copies. Also tears down the
+// biaxial/triaxial extras that share mirrorMesh's packedSplats (secondaryMesh,
+// mesh_ppm, mesh_mmm).
 function disposeMirrorMeshes() {
   if (mirrorMesh) {
     scene.remove(mirrorMesh);
@@ -500,6 +937,21 @@ function disposeMirrorMeshes() {
     m.dispose?.();
   }
   radialMirrors = [];
+  if (secondaryMesh) {
+    scene.remove(secondaryMesh);
+    secondaryMesh.dispose?.();
+    secondaryMesh = null;
+  }
+  if (mesh_ppm) {
+    scene.remove(mesh_ppm);
+    mesh_ppm.dispose?.();
+    mesh_ppm = null;
+  }
+  if (mesh_mmm) {
+    scene.remove(mesh_mmm);
+    mesh_mmm.dispose?.();
+    mesh_mmm = null;
+  }
 }
 
 // Build the source-side SplatMesh by handing the raw .spz bytes for slot A
@@ -662,12 +1114,20 @@ function fitPlaneBoundsFromData(splatForFit) {
   const softAuto = Math.max(0.02, safeExtent * 0.015);
   ui.setSoftEdgeBounds(softMax, softAuto);
 
-  // Size the plane visualization
+  // Size all three plane visualizations (biaxial uses 2, triaxial uses 3)
   const planeSize = safeExtent * 2;
   planeMesh.geometry.dispose();
   planeMesh.geometry = new THREE.PlaneGeometry(planeSize, planeSize);
   planeEdges.geometry.dispose();
   planeEdges.geometry = new THREE.EdgesGeometry(planeMesh.geometry);
+  planeMesh2.geometry.dispose();
+  planeMesh2.geometry = new THREE.PlaneGeometry(planeSize, planeSize);
+  planeEdges2.geometry.dispose();
+  planeEdges2.geometry = new THREE.EdgesGeometry(planeMesh2.geometry);
+  planeMesh3.geometry.dispose();
+  planeMesh3.geometry = new THREE.PlaneGeometry(planeSize, planeSize);
+  planeEdges3.geometry.dispose();
+  planeEdges3.geometry = new THREE.EdgesGeometry(planeMesh3.geometry);
 
   // Camera looks at the splat center, sits ~2x extent away. We use the AABB
   // center rather than world origin so the user can see their splat right
@@ -759,6 +1219,12 @@ async function handleDownload() {
     splatGroupA.updateMatrixWorld(true);
     splatGroupB.updateMatrixWorld(true);
     const axisIdx = AXES[ui.state.axis];
+    const mode = ui.state.symmetryMode;
+    const biaxial = mode === "biaxial" || mode === "triaxial";
+    const triaxial = mode === "triaxial";
+    // Auto-picked perpendicular axes (matches applyUIState's rule).
+    const axisIdx2 = axisIdx === 0 ? 2 : 0;
+    const axisIdx3 = 3 - axisIdx - axisIdx2;
     const radialCount = Math.max(1, Math.floor(ui.state.radialCount));
 
     // Decompose each group's matrixWorld into position/quaternion/scale so
@@ -823,9 +1289,17 @@ async function handleDownload() {
         ]),
         sA,
       );
-      parts.push(
-        keepSourceSide(worldA, axisIdx, ui.state.plane, ui.state.flipSide),
+      let partA = keepSourceSide(
+        worldA,
+        axisIdx,
+        ui.state.plane,
+        ui.state.flipSide,
       );
+      // In biaxial/triaxial mode, clip to the source side of every other
+      // plane too so this part only occupies its specific octant.
+      if (biaxial) partA = keepSourceSide(partA, axisIdx2, 0, false);
+      if (triaxial) partA = keepSourceSide(partA, axisIdx3, 0, false);
+      parts.push(partA);
 
       // B: clone, pre-X-flip (matches mirrorBytesB in the live preview),
       // apply T_B, keep mirror side. Falls back to A's data when B is empty.
@@ -841,21 +1315,144 @@ async function handleDownload() {
         ]),
         sB,
       );
+      let partB = keepMirrorSide(
+        worldB,
+        axisIdx,
+        ui.state.plane,
+        ui.state.flipSide,
+      );
+      if (biaxial) partB = keepSourceSide(partB, axisIdx2, 0, false);
+      if (triaxial) partB = keepSourceSide(partB, axisIdx3, 0, false);
+      parts.push(partB);
+    }
+
+    // Biaxial / triaxial extras. One copy each — these don't get the radial
+    // multiplication in V1 (matches the preview, which also keeps a single
+    // copy of each extra octant regardless of radialCount).
+    //
+    // Helper: bake one octant. `m` is the world matrix to apply (det = +1),
+    // `useXFlip` says whether the splat data should be pre-X-flipped first
+    // (true for odd-parity octants), and `clips` is an array of
+    // [axisIdx, plane, useMirrorSide] entries that intersect the result.
+    function bakeOctant(m, useXFlip, clips) {
+      const pos = new THREE.Vector3();
+      const quat = new THREE.Quaternion();
+      const scl = new THREE.Vector3();
+      m.decompose(pos, quat, scl);
+      const s = (scl.x + scl.y + scl.z) / 3;
+      const src = useXFlip ? splatForMirror : splatA;
+      const world = useXFlip ? mirrorAllSplats(src, 0, 0) : cloneSplatData(src);
+      applyTransform(
+        world,
+        m.elements,
+        new Float32Array([quat.x, quat.y, quat.z, quat.w]),
+        s,
+      );
+      let part = world;
+      for (const [ax, plane, mirrorSide] of clips) {
+        part = mirrorSide
+          ? keepMirrorSide(part, ax, plane, ax === axisIdx ? ui.state.flipSide : false)
+          : keepSourceSide(part, ax, plane, ax === axisIdx ? ui.state.flipSide : false);
+      }
+      return part;
+    }
+
+    if (biaxial) {
+      // C (+-+): reflection across plane 2 only. 1 minus → X-flipped data.
+      //   M_C = Reflect_world2 · M_A · Reflect_local_X
+      const matC = new THREE.Matrix4()
+        .multiplyMatrices(reflectWorld2, splatGroupA.matrixWorld)
+        .multiply(reflectLocal);
+      const clipsC = [
+        [axisIdx, ui.state.plane, false], // source of P1
+        [axisIdx2, 0, true], // mirror of P2
+      ];
+      if (triaxial) clipsC.push([axisIdx3, 0, false]); // source of P3
+      parts.push(bakeOctant(matC, true, clipsC));
+
+      // D (--+): reflection across BOTH planes 1 and 2. 2 minuses → original data.
+      //   M_D = Reflect_world · Reflect_world2 · M_A
+      const matD = new THREE.Matrix4()
+        .multiplyMatrices(reflectWorld, reflectWorld2)
+        .multiply(splatGroupA.matrixWorld);
+      const clipsD = [
+        [axisIdx, ui.state.plane, true], // mirror of P1
+        [axisIdx2, 0, true], // mirror of P2
+      ];
+      if (triaxial) clipsD.push([axisIdx3, 0, false]); // source of P3
+      parts.push(bakeOctant(matD, false, clipsD));
+    }
+
+    // Triaxial-only octants: the four that lie on the MIRROR side of plane 3.
+    if (triaxial) {
+      // (++-): reflection across plane 3 only. 1 minus → X-flipped data.
+      //   M = Reflect_world3 · M_A · Reflect_local_X
+      const mat_ppm = new THREE.Matrix4()
+        .multiplyMatrices(reflectWorld3, splatGroupA.matrixWorld)
+        .multiply(reflectLocal);
       parts.push(
-        keepMirrorSide(worldB, axisIdx, ui.state.plane, ui.state.flipSide),
+        bakeOctant(mat_ppm, true, [
+          [axisIdx, ui.state.plane, false], // source of P1
+          [axisIdx2, 0, false], // source of P2
+          [axisIdx3, 0, true], // mirror of P3
+        ]),
+      );
+
+      // (-+-): reflection across planes 1 and 3. 2 minuses → original data.
+      //   M = Reflect_world · Reflect_world3 · M_A
+      const mat_mpm = new THREE.Matrix4()
+        .multiplyMatrices(reflectWorld, reflectWorld3)
+        .multiply(splatGroupA.matrixWorld);
+      parts.push(
+        bakeOctant(mat_mpm, false, [
+          [axisIdx, ui.state.plane, true],
+          [axisIdx2, 0, false],
+          [axisIdx3, 0, true],
+        ]),
+      );
+
+      // (+--): reflection across planes 2 and 3. 2 minuses → original data.
+      //   M = Reflect_world2 · Reflect_world3 · M_A
+      const mat_pmm = new THREE.Matrix4()
+        .multiplyMatrices(reflectWorld2, reflectWorld3)
+        .multiply(splatGroupA.matrixWorld);
+      parts.push(
+        bakeOctant(mat_pmm, false, [
+          [axisIdx, ui.state.plane, false],
+          [axisIdx2, 0, true],
+          [axisIdx3, 0, true],
+        ]),
+      );
+
+      // (---): reflection across all three planes = point inversion through
+      // the origin. 3 minuses → X-flipped data.
+      //   M = Reflect_world · Reflect_world2 · Reflect_world3 · M_A · Reflect_local_X
+      const mat_mmm = new THREE.Matrix4()
+        .multiplyMatrices(reflectWorld, reflectWorld2)
+        .multiply(reflectWorld3)
+        .multiply(splatGroupA.matrixWorld)
+        .multiply(reflectLocal);
+      parts.push(
+        bakeOctant(mat_mmm, true, [
+          [axisIdx, ui.state.plane, true],
+          [axisIdx2, 0, true],
+          [axisIdx3, 0, true],
+        ]),
       );
     }
 
     const mirroredData = concatSplats(parts);
     const bytes = encodeSpz(mirroredData);
     const baseName = fileNameA.replace(/\.spz$/i, "");
-    const suffix = splatB
-      ? radialCount > 1
-        ? `-AB-radial${radialCount}`
-        : "-AB"
-      : radialCount > 1
-        ? `-radial${radialCount}`
-        : "-mirrored";
+    // Filename suffix reflects what was baked in.
+    const suffixBits = [];
+    if (splatB) suffixBits.push("AB");
+    if (triaxial) suffixBits.push("triaxial");
+    else if (biaxial) suffixBits.push("biaxial");
+    if (radialCount > 1) suffixBits.push(`radial${radialCount}`);
+    const suffix = suffixBits.length
+      ? `-${suffixBits.join("-")}`
+      : "-mirrored";
     const downloadName = `${baseName}${suffix}.spz`;
     const blob = new Blob([bytes], { type: "application/octet-stream" });
     const url = URL.createObjectURL(blob);
