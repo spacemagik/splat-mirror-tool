@@ -152,9 +152,7 @@ body {
 .axis-btn,
 .mode-btn,
 .cam-btn,
-.target-btn,
-.sym-btn,
-.slot-btn {
+.sym-btn {
   flex: 1;
   padding: 8px 0;
   border: 1px solid var(--panel-border);
@@ -170,30 +168,17 @@ body {
 .axis-btn:hover,
 .mode-btn:hover,
 .cam-btn:hover,
-.target-btn:hover:not(:disabled),
-.sym-btn:hover,
-.slot-btn:hover {
+.sym-btn:hover {
   background: rgba(255, 255, 255, 0.07);
 }
 
 .axis-btn.active,
 .mode-btn.active,
 .cam-btn.active,
-.target-btn.active,
-.sym-btn.active,
-.slot-btn.active {
+.sym-btn.active {
   background: var(--accent-strong);
   border-color: var(--accent-strong);
   color: white;
-}
-
-.target-buttons {
-  margin-top: 6px;
-}
-
-.target-btn:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
 }
 
 input[type="range"] {
@@ -316,32 +301,15 @@ button.primary:disabled {
   position: fixed;
   inset: 0;
   display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
   z-index: 100;
   pointer-events: none;
 }
 
 #drop-overlay.active {
   display: flex;
-}
-
-.drop-half {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: rgba(0, 0, 0, 0.55);
-  border: 2px dashed transparent;
-  transition: background 0.12s, border-color 0.12s;
-  pointer-events: auto;
-}
-
-.drop-half + .drop-half {
-  border-left: 1px solid rgba(255, 255, 255, 0.06);
-}
-
-.drop-half.hover {
-  background: rgba(61, 125, 255, 0.18);
-  border-color: var(--accent);
 }
 
 .drop-card {
@@ -371,29 +339,106 @@ button.primary:disabled {
   letter-spacing: 0.08em;
 }
 
-/* Splat slot row inside the Splats accordion */
-.slot {
+/* ---------- Layers list ---------- */
+.layer-list {
   display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
+.layer-empty {
+  margin: 4px 0 0;
+}
+
+.layer-row {
+  display: grid;
+  /* vis · name · opacity · edit · remove */
+  grid-template-columns: 22px 1fr 60px 22px 22px;
   align-items: center;
   gap: 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.02);
+  transition: border-color 0.12s, background 0.12s;
 }
 
-.slot-name {
-  flex: 1;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
+.layer-row:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.layer-row.active {
+  border-color: var(--accent);
+  background: rgba(61, 125, 255, 0.08);
+}
+
+/* Layer is loaded but the current symmetry mode has no compartment for it,
+   so it's not rendering. We dim the row and underline the name so the user
+   knows that splat is being held in reserve. */
+.layer-row.offscreen {
+  opacity: 0.55;
+}
+.layer-row.offscreen .layer-name {
+  text-decoration: line-through;
+  text-decoration-color: var(--muted);
+}
+
+/* When the global layer hint is a warning (e.g. too many layers for the
+   current mode), color it like the rest of our warning UI. */
+.hint.warn {
+  color: var(--danger);
+}
+
+.layer-vis,
+.layer-edit,
+.layer-remove {
+  border: none;
+  background: transparent;
   color: var(--muted);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  min-width: 0;
+  cursor: pointer;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
+  transition: color 0.12s;
 }
 
-.slot-name.loaded {
+.layer-vis.on {
+  color: var(--accent);
+}
+
+.layer-edit.active {
+  color: var(--accent);
+}
+
+.layer-vis:hover,
+.layer-edit:hover,
+.layer-remove:hover {
   color: var(--text);
 }
 
-.slot button.ghost {
-  padding: 4px 8px;
-  font-size: 11px;
+.layer-remove:hover {
+  color: var(--danger);
+}
+
+.layer-name {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 12px;
+  padding: 3px 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  min-width: 0; /* let it shrink inside the grid cell */
+}
+
+.layer-name:hover,
+.layer-name:focus {
+  border-color: var(--panel-border);
+  outline: none;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.layer-opacity {
+  margin: 0; /* override the global range margin */
 }

@@ -1,29 +1,45 @@
 // Splat Mirror — main app
 //
-// Architecture (think of it like a real bathroom mirror):
+// Architecture (think of it like a real bathroom mirror, but with multiple
+// objects sitting in front of it):
 //
-//   - The symmetry PLANE lives in world space (controlled by axis + plane slider).
-//     It is fixed; the user moves the splats in front of it.
-//   - SLOT A is the source-side splat — it lives in `splatGroup`, which the
-//     gizmo controls. The gizmo moves/rotates it freely in world space.
-//   - SLOT B is an optional mirror-side splat. If B is empty we render A's
-//     own pre-reflected twin on the mirror side (the original "kaleidoscope
-//     selfie" behavior). If B is loaded we render B's pre-reflected version
-//     instead — same spatial location, but a different model. This makes the
-//     two splats appear to mirror each other even though they're different.
+//   - The symmetry PLANE lives in world space (controlled by axis + plane
+//     slider). It is fixed; the user moves the splats in front of it.
 //
-//   - The mirror mesh's world transform is computed every frame as:
+//   - The scene holds up to MAX_LAYERS LAYERS. Each layer is one .spz file
+//     with its own gizmo transform (a THREE.Group anchor), visibility, and
+//     opacity. The gizmo edits the ACTIVE layer.
+//
+//   - EVERY LAYER FULLY AUTO-MIRRORS ITSELF across the shared plane(s). A
+//     single layer at the origin looks exactly like the v1 single-splat
+//     behaviour. Two or more layers each get their own original + mirror
+//     pair (and biaxial/triaxial octants, and radial copies) — so each
+//     layer always has its own reflection visible.
+//
+//     To stop multiple layers from stacking on top of each other at the
+//     origin (the "muddy bleed" problem), new layers are auto-OFFSET along
+//     the secondary perpendicular axis at load time, so they tile next to
+//     each other like stitched panoramas. The user can drag any layer
+//     wherever they want from there.
+//
+//     For a single layer, the mirror mesh's world transform each frame is:
 //        T_mirror = Reflect_world  ·  T_gizmo  ·  Reflect_local
 //
-//     where Reflect_world is the reflection across the user-chosen world plane,
-//     and Reflect_local is a fixed local-X reflection that was baked into the
-//     mirror mesh's data (positions/rotations/SH pre-reflected once at load
-//     time). The two reflections cancel in determinant (det = +1) so the
-//     final transform is a proper rotation + translation that Spark renders
+//     where Reflect_world is the reflection across the user-chosen world
+//     plane, and Reflect_local is a fixed local-X reflection that was baked
+//     into the mirror mesh's data (positions/rotations/SH pre-reflected once
+//     at load time). The two reflections cancel in determinant (det = +1) so
+//     the final transform is a proper rotation + translation Spark renders
 //     correctly.
 //
-// The download bakes A on the source side and (B if loaded, else A) on the
-// mirror side into a single combined .spz that matches the preview.
+//   - Biaxial / triaxial modes add 2 / 6 more octant meshes per layer,
+//     wired up by `applySymmetryMode`. Radial copies further multiply the
+//     visible count via `rebuildRadialMeshes`. To keep this manageable on
+//     the GPU, every extra octant + radial copy uses `maxSh = 0`, and the
+//     active layer is the only one that renders full SH on its primary pair.
+//
+// The download bakes EVERY visible layer's gizmo transform + symmetry tree
+// into a single combined .spz that matches the preview.
 
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
@@ -290,57 +306,210 @@ const tertiaryHideSourceEdit = new SplatEdit({
   sdfs: [clipSdf3],
 });
 
-// ----- Splat groups (gizmo targets) -----
-// splatGroupA owns the SOURCE-side mesh (originalMesh).
-const splatGroupA = new THREE.Group();
-scene.add(splatGroupA);
-splatGroupA.add(new THREE.AxesHelper(0.3));
-
-// splatGroupB is a transform-only anchor for the MIRROR-side splat (B). It
-// has no children. Each frame we compute mirrorMesh's manual matrix from
-// either splatGroupB.matrixWorld (when slot B is loaded) or from the
-// auto-mirror of splatGroupA (when no B is loaded).
-const splatGroupB = new THREE.Group();
-scene.add(splatGroupB);
-
-// ----- State -----
-// Slot A: the SOURCE-side splat (always required to render anything).
-let splatA = null; // decoded original of A (needed for mirror math + download)
-let mirrorBytesA = null; // re-encoded .spz bytes for A's pre-reflected twin
-let fileNameA = "splat.spz";
-
-// Slot B: an OPTIONAL second splat that replaces A's mirror twin.
-let splatB = null; // decoded splat for slot B (null if not loaded)
-let mirrorBytesB = null; // re-encoded .spz bytes for B's pre-reflected twin
-let fileNameB = null;
-
-// Meshes (recreated as needed when slot data changes).
+// ----- Layers -----
 //
-// Naming uses three sign letters indicating which side of each plane the
-// mesh occupies, where '+' = source side of that plane and '-' = mirror side:
+// A "layer" is one loaded .spz with its own gizmo transform, visibility,
+// opacity, and its OWN auto-mirror tree (originalMesh + mirrorMesh + biaxial
+// /triaxial octants + radial copies). The mirror plane is shared across all
+// layers — every layer is reflected by the same plane — but each layer's
+// mirror is rooted in its own group, so layers can be positioned anywhere
+// in the scene and each one gets mirrored to its own twin position.
 //
-//   mesh_ppp  ↔ originalMesh   — quadrant (++) in biaxial, octant (+++) in triaxial
-//   mesh_mpp  ↔ mirrorMesh     — quadrant (-+) / octant (-++)
-//   mesh_pmp  ↔ secondaryMesh  — quadrant (+-) / octant (+-+)   (biaxial+ only)
-//   mesh_mmp  ↔ diagonalMesh   — quadrant (--) / octant (--+)   (biaxial+ only)
-//   mesh_ppm                   — octant (++-)   (triaxial only)
-//   mesh_mpm                   — octant (-+-)   (triaxial only)
-//   mesh_pmm                   — octant (+--)   (triaxial only)
-//   mesh_mmm                   — octant (---)   (triaxial only, point inversion)
+// We cap the count at MAX_LAYERS so the GPU budget stays predictable: in
+// triaxial + radial=N modes the mesh count is `MAX_LAYERS · 8 · N`, which
+// blows up quickly.
+const MAX_LAYERS = 4;
+let layers = []; // active layers, in stable insertion order
+let activeLayerId = null; // which layer the gizmo currently edits
+let nextLayerId = 0; // monotonic counter for unique layer ids
+
+// Auto-offset baseline. Captured from the FIRST loaded layer's AABB so
+// subsequent layers slide over by ~one room's worth along the secondary
+// perpendicular axis at load time. This stops everything from stacking
+// at origin (the "muddy bleed" problem) without forcing the user to do
+// math with the gizmo. They can still drag any layer wherever after.
+let baseLayerExtent = 0;
+
+// Which world-axis index (0 = X, 1 = Y, 2 = Z) we slide new layers along
+// when auto-offsetting. We pick the secondary perpendicular axis of the
+// current primary symmetry axis, using the same rule as ui.js's
+// pickPerpendicularAxes(): primary X → secondary Z, primary Y → X,
+// primary Z → X. (So the up-axis stays free whenever possible.)
+function secondaryAxisIdxFor(primaryAxisIdx) {
+  return primaryAxisIdx === 0 ? 2 : 0;
+}
+
+// Latest symmetry axes pushed by applyUIState. We mirror them out here as
+// module state so updateLayerTransform (called every frame) can size the
+// per-layer slot SDFs without re-reading ui.state on the hot path. They
+// match the three indices computed at the top of applyUIState.
+let _primaryAxisIdx = 0;
+let _secondaryAxisIdx = 2;
+let _tertiaryAxisIdx = 1;
+
+// Huge half-extent used along the slot SDF axes we DON'T want to clip
+// against. Anything well beyond a reasonable scene size works — at 1e4
+// world units, no real splat will ever extend out that far.
+const SLOT_HUGE = 1e4;
+
+// ----- Per-layer mesh slot keys -----
 //
-// "Even-parity" octants (those with an even number of '-' signs) use the
-// ORIGINAL packedSplats data and a world matrix with det = +1. "Odd-parity"
-// octants use the pre-X-flipped data with a world matrix that, combined with
-// the data's bake-in flip, gives the desired reflection. See updateMirrorTransform
+// Each layer carries up to 8 SplatMesh slots — one per compartment of the
+// fullest symmetry mode (triaxial = 8 octants). In simpler modes the
+// trailing slots are kept alive but hidden (so we don't dispose the
+// shared packedSplats buffers — see configureLayerSlot).
+//
+// The sign suffix reads (P1 P2 P3) where '+' = source side of that plane
+// and '-' = mirror side. Order matters: handleDownload's compartmentRecipe
+// and applyActiveLayerSHRule both index into this list.
+const COMPARTMENT_MESH_KEY = [
+  "originalMesh",   // 0  (+ + +)  — primary source
+  "mirrorMesh",     // 1  (- + +)  — primary mirror
+  "secondaryMesh",  // 2  (+ - +)  — biaxial+ only
+  "diagonalMesh",   // 3  (- - +)  — biaxial+ only
+  "mesh_ppm",       // 4  (+ + -)  — triaxial only
+  "mesh_mpm",       // 5  (- + -)  — triaxial only
+  "mesh_pmm",       // 6  (+ - -)  — triaxial only
+  "mesh_mmm",       // 7  (- - -)  — triaxial only (point-inversion)
+];
+
+// How many of the 8 compartments are alive in each symmetry mode.
+function compartmentCount(mode) {
+  if (mode === "triaxial") return 8;
+  if (mode === "biaxial") return 4;
+  return 2;
+}
+
+// Per-mesh-slot signature in comments below: "pps" = (p)rimary-source side,
+// (p)rimary-source side, ... for each of the up-to-three symmetry planes.
+//
+//   originalMesh   — quadrant (++) in biaxial / octant (+++) in triaxial
+//   mirrorMesh     — quadrant (-+) / octant (-++)
+//   secondaryMesh  — quadrant (+-) / octant (+-+)   (biaxial+ only)
+//   diagonalMesh   — quadrant (--) / octant (--+)   (biaxial+ only)
+//   mesh_ppm                                        (triaxial only)
+//   mesh_mpm                                        (triaxial only)
+//   mesh_pmm                                        (triaxial only)
+//   mesh_mmm                                        (triaxial only, point inversion)
+//
+// "Even-parity" octants (0 or 2 minuses) use the ORIGINAL packedSplats data
+// and a world matrix with det = +1. "Odd-parity" octants (1 or 3 minuses)
+// use the pre-X-flipped data with a world matrix that, combined with the
+// data's bake-in flip, gives the desired reflection. See updateLayerTransform
 // for the matrix formulas.
-let originalMesh = null;   // ppp
-let mirrorMesh = null;     // mpp
-let secondaryMesh = null;  // pmp  (biaxial / triaxial)
-let diagonalMesh = null;   // mmp  (biaxial / triaxial)
-let mesh_ppm = null;       // triaxial only
-let mesh_mpm = null;       // triaxial only
-let mesh_pmm = null;       // triaxial only
-let mesh_mmm = null;       // triaxial only — point inversion
+//
+// A Layer object has shape:
+//   {
+//     id, name, splat, mirrorBytes, fileName,
+//     group,          // THREE.Group — the source-side gizmo anchor
+//     originalMesh, mirrorMesh,
+//     secondaryMesh, diagonalMesh,
+//     mesh_ppm, mesh_mpm, mesh_pmm, mesh_mmm,
+//     radialOriginals: [], radialMirrors: [],
+//     visible, opacity,
+//   }
+
+function findLayer(id) {
+  return layers.find((l) => l.id === id) ?? null;
+}
+function activeLayer() {
+  return findLayer(activeLayerId);
+}
+
+function createLayer(name) {
+  const id = `layer-${nextLayerId++}`;
+  const group = new THREE.Group();
+  scene.add(group);
+  group.add(new THREE.AxesHelper(0.3));
+
+  // ----- Per-layer slot SDFs -----
+  //
+  // Each layer carries its own axis-aligned BOX SDF that confines all of
+  // its meshes to a slab along the secondary axis (the "auto-offset"
+  // direction). Without this, layers loaded at different secondary-axis
+  // offsets would still bleed into each other because .spz files have
+  // tons of low-opacity fog splats reaching well beyond their visible
+  // AABB. The slot box is hard along secondary but huge along the other
+  // two axes, so it doesn't interfere with primary/tertiary clipping.
+  //
+  // We build TWO slot SDFs per layer:
+  //   slotSdfSrc  — at layer.group's world position; clips all meshes
+  //                 on the source side of the secondary plane
+  //                 (P2='+', i.e. originalMesh / mirrorMesh / ppm / mpm).
+  //   slotSdfMir  — at the biaxial-reflected position
+  //                 (layer.group reflected across secondary plane);
+  //                 clips meshes whose content the biaxial mode shoves
+  //                 to the mirror side of the secondary plane
+  //                 (P2='-', i.e. secondaryMesh / diagonalMesh / pmm / mmm).
+  //
+  // Without the second SDF, biaxial-reflected octants of non-first layers
+  // would get clipped out by the source slot (which is at +offset, while
+  // their content sits at −offset). Each slot is rebuilt-in-place every
+  // frame in updateLayerSlots().
+  //
+  // Box dimensions live in sdf.scale (Spark reads sizes.xyz from there at
+  // encode time — see SplatEdits.update). We set the actual half-extents
+  // every frame too, because they depend on which axis is currently the
+  // secondary and on baseLayerExtent (only known after the first load).
+  const slotSdfSrc = new SplatEditSdf({
+    type: SplatEditSdfType.BOX,
+    opacity: 0,
+    color: new THREE.Color(1, 1, 1),
+  });
+  slotSdfSrc.scale.set(SLOT_HUGE, SLOT_HUGE, SLOT_HUGE);
+  scene.add(slotSdfSrc);
+
+  const slotSdfMir = new SplatEditSdf({
+    type: SplatEditSdfType.BOX,
+    opacity: 0,
+    color: new THREE.Color(1, 1, 1),
+  });
+  slotSdfMir.scale.set(SLOT_HUGE, SLOT_HUGE, SLOT_HUGE);
+  scene.add(slotSdfMir);
+
+  // invert: true → hide OUTSIDE the box (keep inside). Soft-edge follows
+  // the user's edge-softness slider so adjacent slots blend at their seam.
+  const slotEditSrc = new SplatEdit({
+    rgbaBlendMode: SplatEditRgbaBlendMode.MULTIPLY,
+    softEdge: 0,
+    sdfSmooth: 0,
+    invert: true,
+    sdfs: [slotSdfSrc],
+  });
+
+  const slotEditMir = new SplatEdit({
+    rgbaBlendMode: SplatEditRgbaBlendMode.MULTIPLY,
+    softEdge: 0,
+    sdfSmooth: 0,
+    invert: true,
+    sdfs: [slotSdfMir],
+  });
+
+  return {
+    id,
+    name,
+    splat: null,
+    mirrorBytes: null,
+    fileName: name,
+    group,
+    originalMesh: null,
+    mirrorMesh: null,
+    secondaryMesh: null,
+    diagonalMesh: null,
+    mesh_ppm: null,
+    mesh_mpm: null,
+    mesh_pmm: null,
+    mesh_mmm: null,
+    radialOriginals: [],
+    radialMirrors: [],
+    visible: true,
+    opacity: 1,
+    slotSdfSrc,
+    slotSdfMir,
+    slotEditSrc,
+    slotEditMir,
+  };
+}
 
 // Reusable matrices (avoid per-frame allocation)
 const reflectWorld = new THREE.Matrix4();
@@ -353,21 +522,14 @@ const tmpRotY = new THREE.Matrix4();
 const _tmpMatA = new THREE.Matrix4();
 const _tmpMatB = new THREE.Matrix4();
 const _tmpMatC = new THREE.Matrix4();
-
-// Extra rotated copies for the kaleidoscope effect. The primary pair lives in
-// splatGroup + mirrorMesh; these arrays hold copies 1..(radialCount-1), each
-// rotated by (i * 2π/radialCount) around the world Y axis. They share the
-// same PackedSplats data as the primaries (cheap on GPU memory).
-let radialOriginals = [];
-let radialMirrors = [];
+const _tmpMirrorMat = new THREE.Matrix4();
 
 // ----- Gizmo -----
 const gizmo = new TransformControls(camera, canvas);
 gizmo.size = 0.8;
 const gizmoHelper = gizmo.getHelper ? gizmo.getHelper() : gizmo;
 scene.add(gizmoHelper);
-gizmo.attach(splatGroupA);
-let currentGizmoTarget = "a";
+let currentGizmoLayerId = null; // tracks which layer's group the gizmo is currently attached to
 gizmo.addEventListener("dragging-changed", (e) => {
   // While the user is dragging a gizmo handle, suspend whichever camera
   // controller owns the mouse so its drag doesn't fight the gizmo's drag.
@@ -386,23 +548,40 @@ gizmo.addEventListener("dragging-changed", (e) => {
 const ui = createUI({
   onChange: (state) => applyUIState(state),
   onResetSplat: () => {
-    // Reset whichever group the gizmo is currently editing.
-    const target = ui.state.editTarget === "b" ? splatGroupB : splatGroupA;
-    target.position.set(0, 0, 0);
-    target.quaternion.set(0, 0, 0, 1);
-    target.scale.set(1, 1, 1);
+    const layer = activeLayer();
+    if (!layer) return;
+    layer.group.position.set(0, 0, 0);
+    layer.group.quaternion.set(0, 0, 0, 1);
+    layer.group.scale.set(1, 1, 1);
   },
   onDownload: handleDownload,
-  onLoadFile: async (slot, file) => {
+  onAddLayerFromFile: async (file) => {
+    if (layers.length >= MAX_LAYERS) {
+      ui.setStatus(`At most ${MAX_LAYERS} layers (remove one first)`, true);
+      return;
+    }
     const bytes = new Uint8Array(await file.arrayBuffer());
     try {
-      await loadSpzIntoSlot(slot, bytes, file.name);
+      await addLayerFromBytes(bytes, file.name);
     } catch (err) {
       console.error(err);
-      ui.setStatus(`Failed to load slot ${slot.toUpperCase()}: ${err.message}`, true);
+      ui.setStatus(`Failed to load ${file.name}: ${err.message}`, true);
     }
   },
-  onClearSlot: (slot) => clearSlot(slot),
+  onReplaceLayerFromFile: async (layerId, file) => {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    try {
+      await replaceLayerFromBytes(layerId, bytes, file.name);
+    } catch (err) {
+      console.error(err);
+      ui.setStatus(`Failed to replace layer: ${err.message}`, true);
+    }
+  },
+  onRemoveLayer: (layerId) => removeLayer(layerId),
+  onSelectLayer: (layerId) => selectLayer(layerId),
+  onToggleLayerVisible: (layerId, visible) => setLayerVisible(layerId, visible),
+  onSetLayerOpacity: (layerId, opacity) => setLayerOpacity(layerId, opacity),
+  onRenameLayer: (layerId, name) => renameLayer(layerId, name),
 });
 
 const _vFrom = new THREE.Vector3(0, 0, 1);
@@ -417,6 +596,11 @@ function applyUIState(state) {
   const axisIdx2 = axisIdx === 0 ? 2 : 0;
   const axisIdx3 = 3 - axisIdx - axisIdx2; // the remaining axis (0+1+2 = 3)
   const mode = state.symmetryMode; // 'single' | 'biaxial' | 'triaxial'
+
+  // Cache for the per-frame slot updates in updateLayerTransform.
+  _primaryAxisIdx = axisIdx;
+  _secondaryAxisIdx = axisIdx2;
+  _tertiaryAxisIdx = axisIdx3;
 
   // Position the plane visual in WORLD space — fixed, independent of the splat
   planeGroup.position.set(0, 0, 0);
@@ -485,6 +669,13 @@ function applyUIState(state) {
   secondaryHideSourceEdit.softEdge = state.softEdge;
   tertiaryHideMirrorEdit.softEdge = state.softEdge;
   tertiaryHideSourceEdit.softEdge = state.softEdge;
+  // Per-layer slot edits also pick up the user's edge-softness slider so
+  // adjacent layer slots can blend at their seam instead of having a hard
+  // wall between them.
+  for (const layer of layers) {
+    layer.slotEditSrc.softEdge = state.softEdge;
+    layer.slotEditMir.softEdge = state.softEdge;
+  }
 
   // Scale down the WebGL pixel ratio as more octant meshes come online —
   // each additional mesh roughly doubles fragment work for overlapping splats.
@@ -495,7 +686,9 @@ function applyUIState(state) {
   applySymmetryMode(mode);
 
   // Match the radial-copy count to the slider. Cheap if the count hasn't
-  // changed (the helper does nothing in that case).
+  // changed (the helper does nothing in that case). This also (re)sets
+  // visibility on every existing radial copy, so layers that aren't
+  // visible right now drop their radials too.
   rebuildRadialMeshes(state.radialCount);
 
   // Seed the new biaxial/triaxial meshes with their correct world matrices
@@ -523,20 +716,13 @@ function applyUIState(state) {
   flyControls.fpsMovement.moveSpeed = state.flySpeed;
   flyControls.pointerControls.enable = fly;
 
-  // Edit target — attach the gizmo to whichever splat group the UI selects.
-  // (Falls back to A if the user picked B but B isn't loaded.)
-  const targetName =
-    state.editTarget === "b" && splatB ? "b" : "a";
-  if (targetName !== currentGizmoTarget) {
-    gizmo.detach();
-    gizmo.attach(targetName === "b" ? splatGroupB : splatGroupA);
-    currentGizmoTarget = targetName;
-  }
+  // Gizmo attaches to the active layer's group. If no layer is loaded, detach.
+  attachGizmoToActiveLayer();
 
   // Gizmo mode — available in both orbit and fly. While flying, the
   // dragging-changed handler temporarily pauses fly's mouse-look so you can
   // drag the handle without the camera spinning.
-  if (state.gizmoMode === "off") {
+  if (state.gizmoMode === "off" || !activeLayer()) {
     gizmo.enabled = false;
     if (gizmoHelper) gizmoHelper.visible = false;
   } else {
@@ -544,6 +730,27 @@ function applyUIState(state) {
     if (gizmoHelper) gizmoHelper.visible = true;
     gizmo.setMode(state.gizmoMode);
   }
+}
+
+// Attach the gizmo to the active layer's group, or detach if no layers.
+// Also refreshes the per-layer SH cap so the active layer renders with
+// full view-dependent shading while the others drop to flat shading.
+function attachGizmoToActiveLayer() {
+  const layer = activeLayer();
+  if (!layer) {
+    if (currentGizmoLayerId !== null) {
+      gizmo.detach();
+      currentGizmoLayerId = null;
+    }
+    applyActiveLayerSHRule();
+    return;
+  }
+  if (currentGizmoLayerId !== layer.id) {
+    gizmo.detach();
+    gizmo.attach(layer.group);
+    currentGizmoLayerId = layer.id;
+  }
+  applyActiveLayerSHRule();
 }
 
 // Reflection across the axis-aligned plane: x_axis -> 2*offset - x_axis,
@@ -572,84 +779,75 @@ function computeReflectWorld3(axisIdx, offset) {
   e[12 + axisIdx] = 2 * offset;
 }
 
-// Helper: ensure an octant mesh slot is in the right state — exists & has
-// the requested edits when `wantMesh` is true, or torn down when it's false.
+// Helper: ensure an octant mesh slot is in the right state on a layer —
+// exists & has the requested edits when `wantMesh` is true, hidden (but
+// kept alive) when `wantMesh` is false.
 //
-// We always (re)assign `slot.edits` here, even if the mesh already existed,
+// We do NOT dispose these meshes when switching back to a simpler symmetry
+// mode. Why? Because they share `packedSplats` with the layer's primary
+// pair, and Spark's `SplatMesh.dispose()` releases the underlying GPU buffer
+// — which would corrupt the primary meshes that still reference the same
+// shared buffer. So the rule is: create once on demand, then just toggle
+// `.visible` to enable/disable them. The cost of a hidden SplatMesh is a
+// few hundred bytes; far better than the symptom of "splats vanish when
+// I flip through symmetry modes".
+//
+// We always (re)assign `mesh.edits` here, even if the mesh already existed,
 // because the edit list for a given quadrant/octant CHANGES with the symmetry
-// mode. For example, originalMesh's edits go from `[primary]` in single mode
-// to `[primary, secondaryHideMirror]` in biaxial to `[primary, sec, tert]` in
-// triaxial — same mesh, different clip combination.
+// mode (single = 1 clip per mesh, biaxial = 2, triaxial = 3).
 //
 // Setting `mesh.edits` BEFORE adding to the scene avoids a one-frame window
 // where Spark sees `editable=true` + `edits=null`, falls back to its child-
 // traversal path, and ends up with a different edits buffer layout than the
-// next frame uses. That layout swap is what was causing the splats to flash
-// out when flipping between modes — Spark would rebuild the shader generator
-// for the wrong edit-count and the mesh would skip a render.
-function configureMesh(slot, wantMesh, sourceMesh, edits) {
-  if (wantMesh) {
-    if (!slot) {
-      if (!sourceMesh?.packedSplats) return null;
-      // CRITICAL: When we create a new SplatMesh by sharing another mesh's
-      // packedSplats, Spark's constructor OVERWRITES the shared object's
-      // `.splatEncoding` with DEFAULT_SPLAT_ENCODING unless we explicitly
-      // pass the source's encoding through. That overwrite corrupts the
-      // original .spz quantization parameters (scale range etc.) on the
-      // shared buffer, and every mesh referencing it then decodes splats
-      // at the wrong positions/scales — which looked exactly like "the
-      // splats disappear when I flip symmetry modes".
-      slot = new SplatMesh({
-        packedSplats: sourceMesh.packedSplats,
-        splatEncoding: sourceMesh.packedSplats.splatEncoding,
-      });
-      slot.editable = true;
-      slot.edits = edits; // assign BEFORE scene.add so spark sees them on its first frameUpdate
-      slot.matrixAutoUpdate = false;
-      slot.matrix.identity(); // updateMirrorTransform() will overwrite this same frame
-      // Performance: the extra octant meshes drop view-dependent SH lighting
-      // (the spherical-harmonics coefficients past the DC term). At 8 meshes
-      // for triaxial mode, SH evaluation dominates the fragment shader. The
-      // visual difference on a mirrored copy is very subtle because reflected
-      // SH coefficients already partially break view consistency.
-      slot.maxSh = 0;
-      scene.add(slot);
-    } else {
-      slot.edits = edits;
-    }
-    return slot;
+// next frame uses.
+function configureLayerSlot(layer, slotKey, wantMesh, sourceMesh, edits) {
+  let slot = layer[slotKey];
+
+  // First time we need this octant for the layer — create it. We never
+  // destroy after this point; toggling `.visible` is enough.
+  if (wantMesh && !slot) {
+    if (!sourceMesh?.packedSplats) return;
+    // CRITICAL: When we create a new SplatMesh by sharing another mesh's
+    // packedSplats, Spark's constructor OVERWRITES the shared object's
+    // `.splatEncoding` with DEFAULT_SPLAT_ENCODING unless we explicitly
+    // pass the source's encoding through. That overwrite corrupts the
+    // original .spz quantization parameters (scale range etc.) on the
+    // shared buffer, and every mesh referencing it then decodes splats
+    // at the wrong positions/scales.
+    slot = new SplatMesh({
+      packedSplats: sourceMesh.packedSplats,
+      splatEncoding: sourceMesh.packedSplats.splatEncoding,
+    });
+    slot.editable = true;
+    slot.edits = edits; // assign BEFORE scene.add so spark sees them on its first frameUpdate
+    slot.matrixAutoUpdate = false;
+    slot.matrix.identity(); // updateLayerTransform() will overwrite this same frame
+    // Performance: extra octant meshes drop view-dependent SH lighting.
+    slot.maxSh = 0;
+    scene.add(slot);
+    layer[slotKey] = slot;
   }
-  // wantMesh === false: dispose if present
-  if (slot) {
-    scene.remove(slot);
-    slot.dispose?.();
-  }
-  return null;
+
+  if (!slot) return; // wanted but no source mesh available — bail
+
+  // Refresh state on every call so existing meshes pick up new edit lists,
+  // visibility changes, etc.
+  slot.edits = edits;
+  slot.visible = wantMesh && layer.visible;
 }
 
-// Switch the scene between single-plane (2 meshes), biaxial (4 meshes), and
-// triaxial (8 meshes). Each octant gets clipped by its specific combination
-// of plane half-spaces — multiple SplatEdit items on one mesh AND together
-// because they each multiply alpha by 0 in their half-space.
-//
-//   mesh_ppp (originalMesh): [hide-mirror-P1, hide-mirror-P2 (biax+), hide-mirror-P3 (tri)]
-//   mesh_mpp (mirrorMesh)  : [hide-source-P1, hide-mirror-P2 (biax+), hide-mirror-P3 (tri)]
-//   mesh_pmp (secondary)   : [hide-mirror-P1, hide-source-P2,         hide-mirror-P3 (tri)]
-//   mesh_mmp (diagonal)    : [hide-source-P1, hide-source-P2,         hide-mirror-P3 (tri)]
-//   mesh_ppm (triax only)  : [hide-mirror-P1, hide-mirror-P2,         hide-source-P3]
-//   mesh_mpm (triax only)  : [hide-source-P1, hide-mirror-P2,         hide-source-P3]
-//   mesh_pmm (triax only)  : [hide-mirror-P1, hide-source-P2,         hide-source-P3]
-//   mesh_mmm (triax only)  : [hide-source-P1, hide-source-P2,         hide-source-P3]
-//
-// (Where "source-P_i" / "mirror-P_i" refer to the source/mirror side of plane i.)
-//
-// Octant transforms — see updateMirrorTransform for the matrix formulas.
-function applySymmetryMode(mode) {
+// Per-layer symmetry-mode application. Each layer carries its own set of
+// octant meshes; we configure the same eight clip combinations on every
+// layer so they all participate in the same shared symmetry.
+function applySymmetryModeToLayer(layer, mode) {
   const biaxial = mode === "biaxial" || mode === "triaxial";
   const triaxial = mode === "triaxial";
 
-  // Build all eight edit-lists up front. The variable `biaxial` is captured
-  // in the closure so the helper knows which clips to include.
+  // Build the edits list for ONE mesh (one octant of the symmetry tree).
+  // Order in the array matters: Spark applies edits in sequence. We use
+  // MULTIPLY blend mode everywhere so the order is commutative in effect,
+  // but we still keep the global plane clips first and the per-layer slot
+  // clip last so it's easy to read.
   const editsFor = (sign1, sign2, sign3) => {
     const list = [];
     list.push(sign1 === "+" ? originalClipEdit : mirrorClipEdit);
@@ -657,184 +855,198 @@ function applySymmetryMode(mode) {
       list.push(sign2 === "+" ? secondaryHideMirrorEdit : secondaryHideSourceEdit);
     if (triaxial)
       list.push(sign3 === "+" ? tertiaryHideMirrorEdit : tertiaryHideSourceEdit);
+    // Per-layer slot clip: confines this mesh's content to the layer's
+    // own slab along the secondary axis. P2='+' meshes live on the
+    // source side of the secondary plane → use slotEditSrc; P2='-'
+    // meshes (biaxial / triaxial reflections through the secondary
+    // plane) live on the mirror side → use slotEditMir.
+    list.push(sign2 === "+" ? layer.slotEditSrc : layer.slotEditMir);
     return list;
   };
 
-  // Primary pair is always present (as long as A is loaded), so we just
-  // rewrite their edits in place. In single mode this collapses to a single
-  // clip per mesh; biaxial adds a secondary clip, triaxial adds a tertiary.
-  if (originalMesh) originalMesh.edits = editsFor("+", "+", "+");
-  if (mirrorMesh) mirrorMesh.edits = editsFor("-", "+", "+");
+  // Primary pair — present whenever the layer has data loaded.
+  if (layer.originalMesh) layer.originalMesh.edits = editsFor("+", "+", "+");
+  if (layer.mirrorMesh) layer.mirrorMesh.edits = editsFor("-", "+", "+");
 
-  // Biaxial pair: needed in biaxial AND triaxial. Odd-parity octants (1 or 3
-  // minuses) share the X-flipped pack with mirrorMesh; even-parity (0 or 2
-  // minuses) share originalMesh's pack.
-  secondaryMesh = configureMesh(secondaryMesh, biaxial, mirrorMesh, editsFor("+", "-", "+"));
-  diagonalMesh = configureMesh(diagonalMesh, biaxial, originalMesh, editsFor("-", "-", "+"));
+  // Biaxial pair: needed in biaxial AND triaxial.
+  configureLayerSlot(layer, "secondaryMesh", biaxial, layer.mirrorMesh, editsFor("+", "-", "+"));
+  configureLayerSlot(layer, "diagonalMesh", biaxial, layer.originalMesh, editsFor("-", "-", "+"));
 
-  // Triaxial-only extras (four more octants).
-  mesh_ppm = configureMesh(mesh_ppm, triaxial, mirrorMesh, editsFor("+", "+", "-"));
-  mesh_mpm = configureMesh(mesh_mpm, triaxial, originalMesh, editsFor("-", "+", "-"));
-  mesh_pmm = configureMesh(mesh_pmm, triaxial, originalMesh, editsFor("+", "-", "-"));
-  mesh_mmm = configureMesh(mesh_mmm, triaxial, mirrorMesh, editsFor("-", "-", "-"));
+  // Triaxial-only extras.
+  configureLayerSlot(layer, "mesh_ppm", triaxial, layer.mirrorMesh, editsFor("+", "+", "-"));
+  configureLayerSlot(layer, "mesh_mpm", triaxial, layer.originalMesh, editsFor("-", "+", "-"));
+  configureLayerSlot(layer, "mesh_pmm", triaxial, layer.originalMesh, editsFor("+", "-", "-"));
+  configureLayerSlot(layer, "mesh_mmm", triaxial, layer.mirrorMesh, editsFor("-", "-", "-"));
 }
 
-// When slot B is empty, splatGroupB auto-tracks the mirror of A so the
-// mirror-side mesh follows A's gizmo (original single-splat behaviour).
-// The matrix being decomposed has det = +1 (two reflections cancel), so it
-// decomposes cleanly into a positive-scale transform — no negative scale on
-// splatGroupB, which keeps the gizmo behaving normally if the user later
-// loads a B and starts editing it.
-const _autoSyncMat = new THREE.Matrix4();
-function autoSyncSplatGroupBToA() {
-  splatGroupA.updateMatrixWorld(true);
-  _autoSyncMat.multiplyMatrices(reflectWorld, splatGroupA.matrixWorld);
-  _autoSyncMat.multiply(reflectLocal);
-  _autoSyncMat.decompose(
-    splatGroupB.position,
-    splatGroupB.quaternion,
-    splatGroupB.scale,
+// Apply the chosen symmetry mode to every loaded layer.
+function applySymmetryMode(mode) {
+  for (const layer of layers) applySymmetryModeToLayer(layer, mode);
+}
+
+// Reusable scratch vector for slot updates.
+const _slotWorldPos = new THREE.Vector3();
+
+// Recompute one layer's source/mirror slot SDFs from its current gizmo
+// position and the active symmetry axes. Called once per frame per layer
+// from updateLayerTransform. Cheap — just a few sets and one matrix-world
+// fetch — but adjusting `sdf.scale` re-encodes the SDF buffer next frame,
+// so we only re-set values that actually changed.
+function updateLayerSlots(layer) {
+  // Slot half-width along the secondary axis. Until the first layer has
+  // loaded (and baseLayerExtent has been measured), we fall back to a
+  // huge slot — effectively "no clipping" — so a half-loaded scene still
+  // renders normally.
+  const halfWidth = baseLayerExtent > 0 ? baseLayerExtent / 2 : SLOT_HUGE;
+  const sx = _secondaryAxisIdx === 0 ? halfWidth : SLOT_HUGE;
+  const sy = _secondaryAxisIdx === 1 ? halfWidth : SLOT_HUGE;
+  const sz = _secondaryAxisIdx === 2 ? halfWidth : SLOT_HUGE;
+  // Only call .set() if dimensions actually changed (it triggers an SDF
+  // texture re-encode each frame otherwise).
+  if (
+    layer.slotSdfSrc.scale.x !== sx ||
+    layer.slotSdfSrc.scale.y !== sy ||
+    layer.slotSdfSrc.scale.z !== sz
+  ) {
+    layer.slotSdfSrc.scale.set(sx, sy, sz);
+    layer.slotSdfMir.scale.set(sx, sy, sz);
+  }
+
+  layer.group.getWorldPosition(_slotWorldPos);
+  layer.slotSdfSrc.position.copy(_slotWorldPos);
+  // The mirror slot is the source slot reflected across the secondary
+  // plane at world origin (matches where biaxial mode places that
+  // layer's secondaryMesh / diagonalMesh / pmm / mmm content).
+  layer.slotSdfMir.position.copy(_slotWorldPos);
+  layer.slotSdfMir.position.setComponent(
+    _secondaryAxisIdx,
+    -_slotWorldPos.getComponent(_secondaryAxisIdx),
   );
-  splatGroupB.updateMatrixWorld(true);
 }
 
-// Mirror mesh's world matrix updates each frame from splatGroupB's current
-// transform.
+// Mirror-side mesh of a layer: its matrix is derived from the source-side
+// group each frame. Since each layer has its OWN auto-mirror (no separate
+// gizmo for the mirror side any more), we just compute:
 //
-// splatGroupB is set up so its matrixWorld already encodes the desired final
-// "mirror-side" transform — i.e. autoSync stores Reflect_world · splatGroupA
-// · Reflect_local in splatGroupB, which (when multiplied with the pre-X-flipped
-// mirror data) gives Reflect_world · splatGroupA · p_B in world space.
-// So mirrorMesh.matrix = splatGroupB.matrixWorld; NO extra Reflect_local here.
-function updateMirrorTransform() {
-  if (!mirrorMesh) return;
-  if (!splatB) autoSyncSplatGroupBToA();
-  splatGroupB.updateMatrixWorld(true);
+//   mirrorMesh.matrix = Reflect_world · layer.group.matrixWorld · Reflect_local
+//
+// The Reflect_local "undoes" the pre-X-flip baked into mirrorBytes, and the
+// Reflect_world then moves the result across the active symmetry plane.
+function updateLayerTransform(layer) {
+  if (!layer.originalMesh && !layer.mirrorMesh) return;
+  layer.group.updateMatrixWorld(true);
 
-  mirrorMesh.matrix.copy(splatGroupB.matrixWorld);
-  mirrorMesh.matrixWorldNeedsUpdate = true;
+  // Keep this layer's slot SDFs glued to its world position (translation
+  // only — we deliberately ignore the layer's gizmo rotation/scale so the
+  // slot stays axis-aligned to the world's secondary axis).
+  updateLayerSlots(layer);
+
+  if (layer.mirrorMesh) {
+    _tmpMirrorMat.multiplyMatrices(reflectWorld, layer.group.matrixWorld);
+    layer.mirrorMesh.matrix.multiplyMatrices(_tmpMirrorMat, reflectLocal);
+    layer.mirrorMesh.matrixWorldNeedsUpdate = true;
+  }
 
   // Biaxial / triaxial: drive the extra meshes' world matrices.
   //
   // For an octant with signs (s1, s2, s3) where '-' = mirror across that
   // plane, the effective transform on the ORIGINAL splat positions is:
   //
-  //   T_octant = [Reflect_p1 if s1=-]
-  //            · [Reflect_p2 if s2=-]
-  //            · [Reflect_p3 if s3=-]
-  //            · splatGroupA.matrixWorld
+  //   T_octant = [Reflect_p1 if s1=-] · [Reflect_p2 if s2=-]
+  //            · [Reflect_p3 if s3=-] · layer.group.matrixWorld
   //
-  // That T has det = (-1)^k · det(M_A) where k = number of minus signs.
-  // Three.js / Spark expect a det = +1 mesh matrix to render correctly, so:
-  //   - Even-k (0 or 2 minuses): T already has det = +1 → use ORIGINAL data,
-  //     and mesh.matrix = T.
-  //   - Odd-k (1 or 3 minuses): T has det = -1. We instead use the pre-X-
-  //     flipped data (mirrorMesh.packedSplats) and set mesh.matrix = T · X_flip.
-  //     Then mesh.matrix · X_flipped_data = T · X_flip · X_flip · data = T · data,
-  //     and mesh.matrix has det = (-1)·(-1) = +1 → renders fine.
-  if (secondaryMesh || diagonalMesh || mesh_ppm || mesh_mpm || mesh_pmm || mesh_mmm) {
-    splatGroupA.updateMatrixWorld(true);
-  }
-  if (secondaryMesh) {
+  // Even-k octants (0 or 2 minuses) use the original data and mesh.matrix = T.
+  // Odd-k octants use the X-flipped data, mesh.matrix = T · Reflect_local.
+  if (layer.secondaryMesh) {
     // (+-+): 1 minus (P2) — odd parity, X-flipped data
-    _tmpMatA.multiplyMatrices(reflectWorld2, splatGroupA.matrixWorld);
-    secondaryMesh.matrix.multiplyMatrices(_tmpMatA, reflectLocal);
-    secondaryMesh.matrixWorldNeedsUpdate = true;
+    _tmpMatA.multiplyMatrices(reflectWorld2, layer.group.matrixWorld);
+    layer.secondaryMesh.matrix.multiplyMatrices(_tmpMatA, reflectLocal);
+    layer.secondaryMesh.matrixWorldNeedsUpdate = true;
   }
-  if (diagonalMesh) {
-    // (--+): 2 minuses (P1, P2) — even parity, original data
+  if (layer.diagonalMesh) {
+    // (--+): 2 minuses — even parity, original data
     _tmpMatB.multiplyMatrices(reflectWorld, reflectWorld2);
-    diagonalMesh.matrix.multiplyMatrices(_tmpMatB, splatGroupA.matrixWorld);
-    diagonalMesh.matrixWorldNeedsUpdate = true;
+    layer.diagonalMesh.matrix.multiplyMatrices(_tmpMatB, layer.group.matrixWorld);
+    layer.diagonalMesh.matrixWorldNeedsUpdate = true;
   }
-  if (mesh_ppm) {
+  if (layer.mesh_ppm) {
     // (++-): 1 minus (P3) — odd parity, X-flipped data
-    _tmpMatA.multiplyMatrices(reflectWorld3, splatGroupA.matrixWorld);
-    mesh_ppm.matrix.multiplyMatrices(_tmpMatA, reflectLocal);
-    mesh_ppm.matrixWorldNeedsUpdate = true;
+    _tmpMatA.multiplyMatrices(reflectWorld3, layer.group.matrixWorld);
+    layer.mesh_ppm.matrix.multiplyMatrices(_tmpMatA, reflectLocal);
+    layer.mesh_ppm.matrixWorldNeedsUpdate = true;
   }
-  if (mesh_mpm) {
-    // (-+-): 2 minuses (P1, P3) — even parity, original data
+  if (layer.mesh_mpm) {
+    // (-+-): 2 minuses — even parity, original data
     _tmpMatB.multiplyMatrices(reflectWorld, reflectWorld3);
-    mesh_mpm.matrix.multiplyMatrices(_tmpMatB, splatGroupA.matrixWorld);
-    mesh_mpm.matrixWorldNeedsUpdate = true;
+    layer.mesh_mpm.matrix.multiplyMatrices(_tmpMatB, layer.group.matrixWorld);
+    layer.mesh_mpm.matrixWorldNeedsUpdate = true;
   }
-  if (mesh_pmm) {
-    // (+--): 2 minuses (P2, P3) — even parity, original data
+  if (layer.mesh_pmm) {
+    // (+--): 2 minuses — even parity, original data
     _tmpMatB.multiplyMatrices(reflectWorld2, reflectWorld3);
-    mesh_pmm.matrix.multiplyMatrices(_tmpMatB, splatGroupA.matrixWorld);
-    mesh_pmm.matrixWorldNeedsUpdate = true;
+    layer.mesh_pmm.matrix.multiplyMatrices(_tmpMatB, layer.group.matrixWorld);
+    layer.mesh_pmm.matrixWorldNeedsUpdate = true;
   }
-  if (mesh_mmm) {
+  if (layer.mesh_mmm) {
     // (---): 3 minuses — odd parity, X-flipped data.
-    // T = Reflect_p1 · Reflect_p2 · Reflect_p3 · M_A · X_flip.
-    // When all three planes pass through the origin, the triple reflection
-    // is point inversion (−I), so the rendered output is the splat flipped
-    // through the world origin.
     _tmpMatA.multiplyMatrices(reflectWorld, reflectWorld2);
     _tmpMatB.multiplyMatrices(_tmpMatA, reflectWorld3);
-    _tmpMatC.multiplyMatrices(_tmpMatB, splatGroupA.matrixWorld);
-    mesh_mmm.matrix.multiplyMatrices(_tmpMatC, reflectLocal);
-    mesh_mmm.matrixWorldNeedsUpdate = true;
+    _tmpMatC.multiplyMatrices(_tmpMatB, layer.group.matrixWorld);
+    layer.mesh_mmm.matrix.multiplyMatrices(_tmpMatC, reflectLocal);
+    layer.mesh_mmm.matrixWorldNeedsUpdate = true;
   }
 
-  const extraCount = radialOriginals.length;
+  // Radial copies of this layer.
+  const extraCount = layer.radialOriginals.length;
   if (extraCount === 0) return;
   const totalCount = extraCount + 1;
   for (let i = 0; i < extraCount; i++) {
     const angle = ((i + 1) * 2 * Math.PI) / totalCount;
     tmpRotY.makeRotationY(angle);
 
-    // Source radial copy: RotY(angle) · splatGroupA.matrixWorld
-    radialOriginals[i].matrix.multiplyMatrices(
+    layer.radialOriginals[i].matrix.multiplyMatrices(
       tmpRotY,
-      splatGroupA.matrixWorld,
+      layer.group.matrixWorld,
     );
-    radialOriginals[i].matrixWorldNeedsUpdate = true;
+    layer.radialOriginals[i].matrixWorldNeedsUpdate = true;
 
-    // Mirror radial copy: RotY(angle) · splatGroupB.matrixWorld
-    radialMirrors[i].matrix.multiplyMatrices(
-      tmpRotY,
-      splatGroupB.matrixWorld,
-    );
-    radialMirrors[i].matrixWorldNeedsUpdate = true;
+    // Mirror radial copy = RotY · (Reflect_world · group · Reflect_local)
+    _tmpMirrorMat.multiplyMatrices(reflectWorld, layer.group.matrixWorld);
+    _tmpMatA.multiplyMatrices(_tmpMirrorMat, reflectLocal);
+    layer.radialMirrors[i].matrix.multiplyMatrices(tmpRotY, _tmpMatA);
+    layer.radialMirrors[i].matrixWorldNeedsUpdate = true;
   }
 }
 
-// Rebuild the array of extra radial meshes so it contains exactly
-// `count - 1` pairs (since the primary pair is the originalMesh + mirrorMesh).
-// Each extra is a lightweight SplatMesh sharing the same PackedSplats GPU
-// buffer as the primary — only the world transform differs.
-function rebuildRadialMeshes(count) {
+// Tick every layer's mirror tree. Called from applyUIState() (to seed the
+// first frame after a mode change) and from the render loop.
+function updateMirrorTransform() {
+  for (const layer of layers) updateLayerTransform(layer);
+}
+
+// Rebuild the array of extra radial meshes for a single layer so it shows
+// exactly `count - 1` pairs (since the primary pair is layer.originalMesh +
+// layer.mirrorMesh). Each extra is a lightweight SplatMesh sharing the same
+// PackedSplats GPU buffer as the primary — only the world transform differs.
+//
+// Like the octant meshes, we NEVER dispose radial copies when the count
+// goes down — disposing would free the shared `packedSplats` and corrupt
+// the primary meshes. Instead, we grow the array on demand and hide the
+// extras (set `visible = false`) when the count is lower than the high-
+// water mark we previously needed.
+function rebuildLayerRadialMeshes(layer, count) {
   const desiredExtras = Math.max(0, Math.floor(count) - 1);
 
-  // Dispose extras beyond what we need
-  while (radialOriginals.length > desiredExtras) {
-    const m = radialOriginals.pop();
-    scene.remove(m);
-    m.dispose?.();
-  }
-  while (radialMirrors.length > desiredExtras) {
-    const m = radialMirrors.pop();
-    scene.remove(m);
-    m.dispose?.();
-  }
-
   // Share the GPU-resident PackedSplats from the primary meshes — we just
-  // want extra rotated copies, not extra data.
-  const srcPacked = originalMesh?.packedSplats;
-  const mirrorPacked = mirrorMesh?.packedSplats;
+  // want extra rotated copies, not extra data. We pass `splatEncoding`
+  // through explicitly — see configureLayerSlot for the long explanation.
+  const srcPacked = layer.originalMesh?.packedSplats;
+  const mirrorPacked = layer.mirrorMesh?.packedSplats;
   if (!srcPacked || !mirrorPacked) return;
 
-  // Add extras to reach desired count. Same SH=0 trick as the biaxial/triaxial
-  // extras — kaleidoscope copies are usually further from the camera and
-  // their view-dependent shading is the first thing the eye lets go of.
-  //
-  // We pass `splatEncoding` through explicitly here too — see configureMesh
-  // for the long explanation. tl;dr: without it Spark blows away the .spz's
-  // own quantization parameters on the shared packedSplats and everything
-  // decodes wrong.
-  while (radialOriginals.length < desiredExtras) {
+  // Grow each array to the high-water mark on demand. Hidden extras cost
+  // basically nothing.
+  while (layer.radialOriginals.length < desiredExtras) {
     const o = new SplatMesh({
       packedSplats: srcPacked,
       splatEncoding: srcPacked.splatEncoding,
@@ -844,9 +1056,9 @@ function rebuildRadialMeshes(count) {
     o.matrixAutoUpdate = false;
     o.maxSh = 0;
     scene.add(o);
-    radialOriginals.push(o);
+    layer.radialOriginals.push(o);
   }
-  while (radialMirrors.length < desiredExtras) {
+  while (layer.radialMirrors.length < desiredExtras) {
     const m = new SplatMesh({
       packedSplats: mirrorPacked,
       splatEncoding: mirrorPacked.splatEncoding,
@@ -856,8 +1068,24 @@ function rebuildRadialMeshes(count) {
     m.matrixAutoUpdate = false;
     m.maxSh = 0;
     scene.add(m);
-    radialMirrors.push(m);
+    layer.radialMirrors.push(m);
   }
+
+  // Set visibility on every radial we own: only the first `desiredExtras`
+  // copies are wanted for the current slider value, AND we honor the
+  // layer's own visibility toggle. Hidden extras stay alive in the scene
+  // (so we never dispose the shared packedSplats buffer) — they just
+  // don't render until the user dials the count back up.
+  for (let i = 0; i < layer.radialOriginals.length; i++) {
+    layer.radialOriginals[i].visible = i < desiredExtras && layer.visible;
+  }
+  for (let i = 0; i < layer.radialMirrors.length; i++) {
+    layer.radialMirrors[i].visible = i < desiredExtras && layer.visible;
+  }
+}
+
+function rebuildRadialMeshes(count) {
+  for (const layer of layers) rebuildLayerRadialMeshes(layer, count);
 }
 
 // ----- .spz bytes → SplatMesh (native Spark loader) -----
@@ -883,191 +1111,278 @@ async function loadSpzFromUrl(url) {
   if (!res.ok) throw new Error(`Failed to fetch ${url}: ${res.status}`);
   const buf = new Uint8Array(await res.arrayBuffer());
   const fileName = decodeURIComponent(url.split("/").pop() || "splat.spz");
-  await loadSpzIntoSlot("a", buf, fileName);
+  await addLayerFromBytes(buf, fileName);
 }
 
-// Return whichever pre-reflected .spz bytes should currently feed the mirror
-// mesh (and its radial copies): B's if loaded, A's otherwise.
-function activeMirrorBytes() {
-  return mirrorBytesB ?? mirrorBytesA;
-}
-
-// Tear down the original mesh + any radial source-side copies. Also tears
-// down the biaxial/triaxial extras that share originalMesh's packedSplats
-// (diagonalMesh, mesh_mpm, mesh_pmm).
-function disposeOriginalMeshes() {
-  if (originalMesh) {
-    splatGroupA.remove(originalMesh);
-    originalMesh.dispose?.();
-    originalMesh = null;
+// Tear down every mesh belonging to a layer. Used when the layer is removed
+// or its splat data is replaced. The layer.group itself is left in the scene
+// so the caller can decide whether to also unparent / remove it.
+function disposeLayerMeshes(layer) {
+  if (layer.originalMesh) {
+    layer.group.remove(layer.originalMesh);
+    layer.originalMesh.dispose?.();
+    layer.originalMesh = null;
   }
-  for (const m of radialOriginals) {
+  if (layer.mirrorMesh) {
+    scene.remove(layer.mirrorMesh);
+    layer.mirrorMesh.dispose?.();
+    layer.mirrorMesh = null;
+  }
+  for (const key of [
+    "secondaryMesh",
+    "diagonalMesh",
+    "mesh_ppm",
+    "mesh_mpm",
+    "mesh_pmm",
+    "mesh_mmm",
+  ]) {
+    if (layer[key]) {
+      scene.remove(layer[key]);
+      layer[key].dispose?.();
+      layer[key] = null;
+    }
+  }
+  for (const m of layer.radialOriginals) {
     scene.remove(m);
     m.dispose?.();
   }
-  radialOriginals = [];
-  if (diagonalMesh) {
-    scene.remove(diagonalMesh);
-    diagonalMesh.dispose?.();
-    diagonalMesh = null;
-  }
-  if (mesh_mpm) {
-    scene.remove(mesh_mpm);
-    mesh_mpm.dispose?.();
-    mesh_mpm = null;
-  }
-  if (mesh_pmm) {
-    scene.remove(mesh_pmm);
-    mesh_pmm.dispose?.();
-    mesh_pmm = null;
-  }
-}
-
-// Tear down the mirror mesh + any radial mirror copies. Also tears down the
-// biaxial/triaxial extras that share mirrorMesh's packedSplats (secondaryMesh,
-// mesh_ppm, mesh_mmm).
-function disposeMirrorMeshes() {
-  if (mirrorMesh) {
-    scene.remove(mirrorMesh);
-    mirrorMesh.dispose?.();
-    mirrorMesh = null;
-  }
-  for (const m of radialMirrors) {
+  layer.radialOriginals = [];
+  for (const m of layer.radialMirrors) {
     scene.remove(m);
     m.dispose?.();
   }
-  radialMirrors = [];
-  if (secondaryMesh) {
-    scene.remove(secondaryMesh);
-    secondaryMesh.dispose?.();
-    secondaryMesh = null;
-  }
-  if (mesh_ppm) {
-    scene.remove(mesh_ppm);
-    mesh_ppm.dispose?.();
-    mesh_ppm = null;
-  }
-  if (mesh_mmm) {
-    scene.remove(mesh_mmm);
-    mesh_mmm.dispose?.();
-    mesh_mmm = null;
-  }
+  layer.radialMirrors = [];
 }
 
-// Build the source-side SplatMesh by handing the raw .spz bytes for slot A
-// to Spark's native loader. We then mark the mesh editable and attach the
-// SDF clip so only the source-side half of the splat shows in the preview.
-async function buildOriginalMesh(spzBytes) {
-  disposeOriginalMeshes();
-  if (!spzBytes) return;
-  originalMesh = await buildSplatMeshFromSpzBytes(spzBytes);
-  originalMesh.editable = true;
-  originalMesh.edits = [originalClipEdit];
-  splatGroupA.add(originalMesh);
+// Build the source-side + mirror-side primary pair for a layer from raw .spz
+// bytes. The pre-reflected mirror bytes are also computed and stashed on the
+// layer so download() and slot replacement don't need to redo the mirror math.
+async function buildLayerPrimaries(layer, spzBytes, decoded) {
+  // Source-side mesh loads straight from the original .spz bytes — Spark
+  // decodes through its high-precision native loader (no double quantization).
+  layer.originalMesh = await buildSplatMeshFromSpzBytes(spzBytes);
+  layer.originalMesh.editable = true;
+  layer.originalMesh.edits = [originalClipEdit];
+  layer.originalMesh.visible = layer.visible;
+  layer.group.add(layer.originalMesh);
+
+  // Mirror-side mesh: re-encode a pre-X-flipped copy of the data and load it
+  // through the same path so render quality matches the source.
+  layer.mirrorBytes = encodeSpz(mirrorAllSplats(decoded, 0, 0));
+  layer.mirrorMesh = await buildSplatMeshFromSpzBytes(layer.mirrorBytes);
+  layer.mirrorMesh.editable = true;
+  layer.mirrorMesh.edits = [mirrorClipEdit];
+  layer.mirrorMesh.matrixAutoUpdate = false;
+  layer.mirrorMesh.visible = layer.visible;
+  scene.add(layer.mirrorMesh);
 }
 
-// Build the mirror-side SplatMesh from the active pre-reflected .spz bytes.
-// The mesh's matrix is driven manually each frame by updateMirrorTransform().
-async function buildMirrorMesh() {
-  disposeMirrorMeshes();
-  const bytes = activeMirrorBytes();
-  if (!bytes) return;
-  mirrorMesh = await buildSplatMeshFromSpzBytes(bytes);
-  mirrorMesh.editable = true;
-  mirrorMesh.edits = [mirrorClipEdit];
-  mirrorMesh.matrixAutoUpdate = false;
-  scene.add(mirrorMesh);
-}
-
-async function loadSpzIntoSlot(slot, bytes, fileName) {
-  if (slot !== "a" && slot !== "b") return;
+// Common load path: takes raw .spz bytes and a target layer, decodes once
+// for the mirror math, then hands the original bytes to Spark for rendering.
+async function loadBytesIntoLayer(layer, bytes, fileName) {
   ui.setStatus(`Decoding ${fileName}…`);
   ui.enableDownload(false);
 
-  // We still decode the .spz once on our side so we can do the mirror math
-  // and write an export at the end. But the bytes that actually feed the
-  // renderer are passed straight to Spark's native loader — no per-splat
-  // re-quantization through setPackedSplat.
   const decoded = decodeSpz(bytes);
+  layer.fileName = fileName;
+  layer.name = fileName.replace(/\.spz$/i, "");
+  layer.splat = decoded;
 
-  if (slot === "a") {
-    splatA = decoded;
-    fileNameA = fileName;
+  disposeLayerMeshes(layer);
 
-    disposeOriginalMeshes();
-    disposeMirrorMeshes();
-    mirrorBytesA = null;
-
-    ui.setStatus(
-      `Building meshes (${decoded.numPoints.toLocaleString()} splats from A)…`,
-    );
-
-    // The source-side mesh loads straight from the original .spz bytes.
-    await buildOriginalMesh(bytes);
-
-    // The mirror-side mesh uses a re-encoded copy of the data with every
-    // splat already pre-reflected across local X. Encoding back to .spz
-    // and going through Spark's native loader keeps the rendering quality
-    // identical to the source mesh.
-    mirrorBytesA = encodeSpz(mirrorAllSplats(decoded, 0, 0));
-    await buildMirrorMesh();
-
-    fitPlaneBoundsFromData(splatA);
-  } else {
-    splatB = decoded;
-    fileNameB = fileName;
-
-    disposeMirrorMeshes();
-    mirrorBytesB = null;
-
-    ui.setStatus(
-      `Building mirror-side mesh (${decoded.numPoints.toLocaleString()} splats from B)…`,
-    );
-    mirrorBytesB = encodeSpz(mirrorAllSplats(decoded, 0, 0));
-    await buildMirrorMesh();
-
-    // First-time slot-B load: splatGroupB has been auto-synced to A's
-    // mirror every frame while B was empty, so its current transform is
-    // already at the right "mirror of A" position. Nothing extra to do.
-  }
-
-  applyUIState(ui.state); // re-apply (rebuilds radial copies on the new meshes)
-  updateMirrorTransform();
-  ui.setSlotName("a", splatA ? fileNameA : null);
-  ui.setSlotName("b", splatB ? fileNameB : null);
-  ui.setEditTargetAvailability({ aLoaded: !!splatA, bLoaded: !!splatB });
   ui.setStatus(
-    `Slot ${slot.toUpperCase()} loaded: ${decoded.numPoints.toLocaleString()} splats from ${fileName}`,
+    `Building meshes (${decoded.numPoints.toLocaleString()} splats)…`,
   );
-  if (splatA) ui.enableDownload(true);
+  await buildLayerPrimaries(layer, bytes, decoded);
 }
 
-async function clearSlot(slot) {
-  if (slot === "a") {
-    // Clearing A unloads everything (nothing to render without a source-side splat).
-    splatA = null;
-    fileNameA = "splat.spz";
-    disposeOriginalMeshes();
-    disposeMirrorMeshes();
-    mirrorBytesA = null;
-    // Slot B's pre-reflected bytes are still valid, but with no A there's
-    // nothing to anchor the mirror to. Keep B's data around so it reappears
-    // when the user reloads A.
-    ui.enableDownload(false);
-  } else {
-    if (!splatB) return;
-    splatB = null;
-    fileNameB = null;
-    disposeMirrorMeshes();
-    mirrorBytesB = null;
-    // Mirror reverts to A's twin
-    await buildMirrorMesh();
-    applyUIState(ui.state);
-    updateMirrorTransform();
+// Add a brand-new layer (when the user adds a splat via drag-and-drop or
+// the "Add splat" button). Refuses to exceed MAX_LAYERS — callers check
+// before calling.
+async function addLayerFromBytes(bytes, fileName) {
+  if (layers.length >= MAX_LAYERS) {
+    ui.setStatus(`At most ${MAX_LAYERS} layers (remove one first)`, true);
+    return;
   }
-  ui.setSlotName("a", splatA ? fileNameA : null);
-  ui.setSlotName("b", splatB ? fileNameB : null);
-  ui.setStatus(`Slot ${slot.toUpperCase()} cleared`);
+  const layerIdx = layers.length; // 0 for the first one, 1 for the second, etc.
+  const layer = createLayer(fileName.replace(/\.spz$/i, ""));
+  layers.push(layer);
+
+  await loadBytesIntoLayer(layer, bytes, fileName);
+
+  // Selecting the new layer makes the gizmo jump to it immediately, which
+  // is what the user expects after dropping a file in.
+  activeLayerId = layer.id;
+
+  if (layerIdx === 0) {
+    // First layer: fit the plane visualization + camera to its AABB, AND
+    // capture its extent as our auto-offset baseline for subsequent layers.
+    fitPlaneBoundsFromData(layer.splat);
+    const aabb = computeAabb(layer.splat.positions, layer.splat.numPoints);
+    baseLayerExtent = Math.max(
+      aabb.maxX - aabb.minX,
+      aabb.maxY - aabb.minY,
+      aabb.maxZ - aabb.minZ,
+      1, // floor so a tiny first splat doesn't make all subsequent layers stack on top
+    );
+  } else {
+    // Auto-offset: slide the new layer over by (idx * baseExtent) along
+    // the secondary perpendicular axis so it lands NEXT TO the existing
+    // layers instead of on top of them. The user can drag with the gizmo
+    // after if they want a different layout — this is just a sensible
+    // starting position for "stitched" environments. Each layer still
+    // auto-mirrors itself across the same shared plane, so each gets its
+    // own reflection.
+    const primaryAxisIdx = AXES[ui.state.axis];
+    const secAxisIdx = secondaryAxisIdxFor(primaryAxisIdx);
+    layer.group.position.setComponent(secAxisIdx, layerIdx * baseLayerExtent);
+  }
+
+  syncLayerUI();
+  applyUIState(ui.state); // rebuilds octant/radial meshes for the new layer
+  updateMirrorTransform();
+  ui.setStatus(
+    `Loaded ${layer.name} (${layer.splat.numPoints.toLocaleString()} splats)`,
+  );
+  ui.enableDownload(true);
+}
+
+// Replace an existing layer's data (when the user clicks the row's load
+// button on a layer that already has data, or drops a file with a layer
+// targeted).
+async function replaceLayerFromBytes(layerId, bytes, fileName) {
+  const layer = findLayer(layerId);
+  if (!layer) return;
+  await loadBytesIntoLayer(layer, bytes, fileName);
+  syncLayerUI();
+  applyUIState(ui.state);
+  updateMirrorTransform();
+  ui.setStatus(
+    `Replaced ${layer.name} (${layer.splat.numPoints.toLocaleString()} splats)`,
+  );
+  ui.enableDownload(true);
+}
+
+function removeLayer(layerId) {
+  const idx = layers.findIndex((l) => l.id === layerId);
+  if (idx === -1) return;
+  const layer = layers[idx];
+  disposeLayerMeshes(layer);
+  // Layer-level resources that aren't part of the mesh tree.
+  scene.remove(layer.slotSdfSrc);
+  scene.remove(layer.slotSdfMir);
+  scene.remove(layer.group);
+  layers.splice(idx, 1);
+
+  // If we removed the active one, pick the next sibling (prefer left, then right).
+  if (activeLayerId === layerId) {
+    if (layers.length === 0) activeLayerId = null;
+    else if (idx > 0) activeLayerId = layers[idx - 1].id;
+    else activeLayerId = layers[0].id;
+  }
+
+  syncLayerUI();
+  applyUIState(ui.state);
+  updateMirrorTransform();
+  ui.enableDownload(layers.some((l) => l.splat));
+  if (layers.length === 0) ui.setStatus("All layers cleared");
+  else ui.setStatus(`Removed ${layer.name}`);
+}
+
+function selectLayer(layerId) {
+  if (!findLayer(layerId)) return;
+  activeLayerId = layerId;
+  syncLayerUI();
+  applyUIState(ui.state); // re-attach gizmo to the new active layer
+}
+
+function setLayerVisible(layerId, visible) {
+  const layer = findLayer(layerId);
+  if (!layer) return;
+  layer.visible = visible;
+  // Re-run the UI-state pipeline so the octant + radial meshes' computed
+  // visibility (which AND-s layer.visible with "is this slot active in the
+  // current mode") gets refreshed alongside the primary pair.
+  applyLayerVisibility(layer);
+  applyUIState(ui.state);
+  syncLayerUI();
+}
+
+function setLayerOpacity(layerId, opacity) {
+  const layer = findLayer(layerId);
+  if (!layer) return;
+  layer.opacity = Math.max(0, Math.min(1, opacity));
+  applyLayerOpacity(layer);
+  syncLayerUI();
+}
+
+function renameLayer(layerId, name) {
+  const layer = findLayer(layerId);
+  if (!layer) return;
+  layer.name = name;
+}
+
+// Push the layer's `visible` flag onto the primary pair only. The octant
+// and radial extras have a computed visibility (`isWanted && layer.visible`)
+// that's reapplied by applyUIState() → applySymmetryMode() / rebuildRadial,
+// so we don't touch them here — touching them directly would un-hide an
+// octant that the current symmetry mode doesn't want shown.
+function applyLayerVisibility(layer) {
+  if (layer.originalMesh) layer.originalMesh.visible = layer.visible;
+  if (layer.mirrorMesh) layer.mirrorMesh.visible = layer.visible;
+}
+
+// Push a layer's `opacity` (0..1) onto every mesh it owns. Spark's SplatMesh
+// exposes a built-in `opacity` uniform we just scale uniformly per mesh.
+function applyLayerOpacity(layer) {
+  const meshes = [
+    layer.originalMesh,
+    layer.mirrorMesh,
+    layer.secondaryMesh,
+    layer.diagonalMesh,
+    layer.mesh_ppm,
+    layer.mesh_mpm,
+    layer.mesh_pmm,
+    layer.mesh_mmm,
+    ...layer.radialOriginals,
+    ...layer.radialMirrors,
+  ];
+  for (const m of meshes) {
+    if (m) m.opacity = layer.opacity;
+  }
+}
+
+// Push the layer list into the UI (rebuilds the row list whenever the
+// underlying layer set or active selection changes). Every loaded layer
+// is fully visible (with its own mirror), so we never report an
+// "offscreen" state any more.
+function syncLayerUI() {
+  ui.renderLayerList(
+    layers.map((l) => ({
+      id: l.id,
+      name: l.name,
+      visible: l.visible,
+      opacity: l.opacity,
+      active: l.id === activeLayerId,
+      loaded: !!l.splat,
+      offscreen: false,
+    })),
+    { maxLayers: MAX_LAYERS, activeLayerId, hint: null },
+  );
+}
+
+// Active-layer-only full SH: every mesh on the active (editing) layer
+// renders with the .spz's full SH degree; other layers drop to SH=0 (DC
+// term only). We lift the cap on EVERY mesh of the active layer (hidden
+// ones don't cost anything). Radial copies still always render at SH=0
+// because they're inherently low-priority.
+function applyActiveLayerSHRule() {
+  for (const layer of layers) {
+    const cap = layer.id === activeLayerId ? Infinity : 0;
+    for (const key of COMPARTMENT_MESH_KEY) {
+      if (layer[key]) layer[key].maxSh = cap;
+    }
+  }
 }
 
 function computeAabb(positions, n) {
@@ -1092,7 +1407,7 @@ function computeAabb(positions, n) {
 }
 
 function fitPlaneBoundsFromData(splatForFit) {
-  const splatData = splatForFit ?? splatA;
+  const splatData = splatForFit ?? layers[0]?.splat;
   if (!splatData) return;
   const aabb = computeAabb(splatData.positions, splatData.numPoints);
   const extent = Math.max(
@@ -1144,16 +1459,10 @@ function fitPlaneBoundsFromData(splatForFit) {
 }
 
 // ----- Drag and drop -----
-// The overlay is split into two halves (data-slot="a" | "b"). When the user
-// drags a file over the window we show the overlay; the half they release
-// the mouse on decides which slot the file loads into.
+// Drop a .spz anywhere on the window to ADD it as a new layer (up to
+// MAX_LAYERS). If the cap is hit we show an error in the status line.
 const dropOverlay = document.getElementById("drop-overlay");
-const dropHalves = dropOverlay.querySelectorAll(".drop-half");
 let dragDepth = 0;
-
-function clearDropHover() {
-  dropHalves.forEach((h) => h.classList.remove("hover"));
-}
 
 window.addEventListener("dragenter", (e) => {
   e.preventDefault();
@@ -1166,185 +1475,71 @@ window.addEventListener("dragleave", (e) => {
   if (dragDepth <= 0) {
     dragDepth = 0;
     dropOverlay.classList.remove("active");
-    clearDropHover();
   }
 });
 window.addEventListener("dragover", (e) => {
   e.preventDefault();
 });
-
-dropHalves.forEach((half) => {
-  half.addEventListener("dragenter", () => {
-    clearDropHover();
-    half.classList.add("hover");
-  });
-  half.addEventListener("dragover", (e) => {
-    e.preventDefault();
-  });
-  half.addEventListener("drop", async (e) => {
-    e.preventDefault();
-    dragDepth = 0;
-    dropOverlay.classList.remove("active");
-    clearDropHover();
-    const file = e.dataTransfer?.files?.[0];
-    if (!file) return;
-    if (!file.name.toLowerCase().endsWith(".spz")) {
-      ui.setStatus("Only .spz files are supported", true);
-      return;
-    }
-    const slot = half.dataset.slot;
-    const bytes = new Uint8Array(await file.arrayBuffer());
-    try {
-      await loadSpzIntoSlot(slot, bytes, file.name);
-    } catch (err) {
-      console.error(err);
-      ui.setStatus(
-        `Failed to load slot ${slot.toUpperCase()}: ${err.message}`,
-        true,
-      );
-    }
-  });
+window.addEventListener("drop", async (e) => {
+  e.preventDefault();
+  dragDepth = 0;
+  dropOverlay.classList.remove("active");
+  const file = e.dataTransfer?.files?.[0];
+  if (!file) return;
+  if (!file.name.toLowerCase().endsWith(".spz")) {
+    ui.setStatus("Only .spz files are supported", true);
+    return;
+  }
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  try {
+    await addLayerFromBytes(bytes, file.name);
+  } catch (err) {
+    console.error(err);
+    ui.setStatus(`Failed to load ${file.name}: ${err.message}`, true);
+  }
 });
 
 // ----- Download -----
-// Takes the original splat, applies the current gizmo transform (so the splat
-// is in world space), then runs the clip+mirror in world space using the
-// user's chosen axis/offset/flip-side. The result is a single .spz of the
-// symmetric splat as it appears in the preview.
+// Bakes the symmetry tree the user is currently seeing — one part per
+// visible, loaded layer × every compartment in the active symmetry mode
+// × the radial rotation count (compartments 0 + 1 only) — and
+// concatenates everything into a single .spz. Each layer contributes its
+// own full mirror tree, exactly matching the preview.
 async function handleDownload() {
-  if (!splatA) return;
+  const loaded = layers.filter((l) => l.splat);
+  if (loaded.length === 0) return;
+
   ui.enableDownload(false);
-  ui.setStatus("Applying gizmo + mirror, encoding .spz…");
+  ui.setStatus("Applying transforms + symmetry, encoding .spz…");
   try {
-    splatGroupA.updateMatrixWorld(true);
-    splatGroupB.updateMatrixWorld(true);
     const axisIdx = AXES[ui.state.axis];
     const mode = ui.state.symmetryMode;
-    const biaxial = mode === "biaxial" || mode === "triaxial";
-    const triaxial = mode === "triaxial";
+    const compCount = compartmentCount(mode);
     // Auto-picked perpendicular axes (matches applyUIState's rule).
     const axisIdx2 = axisIdx === 0 ? 2 : 0;
     const axisIdx3 = 3 - axisIdx - axisIdx2;
     const radialCount = Math.max(1, Math.floor(ui.state.radialCount));
 
-    // Decompose each group's matrixWorld into position/quaternion/scale so
-    // we can pass a scalar uniform-scale into applyTransform (which only
-    // supports uniform). Non-uniform scale is approximated by the average.
-    const posA = new THREE.Vector3();
-    const quatA = new THREE.Quaternion();
-    const sclA = new THREE.Vector3();
-    splatGroupA.matrixWorld.decompose(posA, quatA, sclA);
-    const sA = (sclA.x + sclA.y + sclA.z) / 3;
-    if (Math.max(sclA.x, sclA.y, sclA.z) / Math.min(sclA.x, sclA.y, sclA.z) > 1.001) {
-      ui.setStatus(
-        "Note: non-uniform scale on A — download uses the average; preview is exact.",
-      );
-    }
-
-    const posB = new THREE.Vector3();
-    const quatB = new THREE.Quaternion();
-    const sclB = new THREE.Vector3();
-    splatGroupB.matrixWorld.decompose(posB, quatB, sclB);
-    const sB = (sclB.x + sclB.y + sclB.z) / 3;
-
-    const splatForMirror = splatB ?? splatA;
-    if (
-      splatB &&
-      (splatA.shCoeffsPerPoint !== splatB.shCoeffsPerPoint ||
-        splatA.shDegree !== splatB.shDegree)
-    ) {
-      ui.setStatus(
-        `Note: A and B have different SH degrees; B will be downscaled to A's schema.`,
-      );
-    }
-
     const parts = [];
-    const rotMat = new THREE.Matrix4();
-    const rotQuat = new THREE.Quaternion();
-    const composedMatA = new THREE.Matrix4();
-    const composedMatB = new THREE.Matrix4();
-    const composedQuatA = new THREE.Quaternion();
-    const composedQuatB = new THREE.Quaternion();
     const Y_AXIS = new THREE.Vector3(0, 1, 0);
 
-    for (let i = 0; i < radialCount; i++) {
-      const angle = (i * 2 * Math.PI) / radialCount;
-      rotQuat.setFromAxisAngle(Y_AXIS, angle);
-      rotMat.makeRotationFromQuaternion(rotQuat);
-      composedMatA.multiplyMatrices(rotMat, splatGroupA.matrixWorld);
-      composedMatB.multiplyMatrices(rotMat, splatGroupB.matrixWorld);
-      composedQuatA.multiplyQuaternions(rotQuat, quatA);
-      composedQuatB.multiplyQuaternions(rotQuat, quatB);
-
-      // A: clone, apply T_A (pos+quat+uniform scale), keep source side.
-      const worldA = cloneSplatData(splatA);
-      applyTransform(
-        worldA,
-        composedMatA.elements,
-        new Float32Array([
-          composedQuatA.x,
-          composedQuatA.y,
-          composedQuatA.z,
-          composedQuatA.w,
-        ]),
-        sA,
-      );
-      let partA = keepSourceSide(
-        worldA,
-        axisIdx,
-        ui.state.plane,
-        ui.state.flipSide,
-      );
-      // In biaxial/triaxial mode, clip to the source side of every other
-      // plane too so this part only occupies its specific octant.
-      if (biaxial) partA = keepSourceSide(partA, axisIdx2, 0, false);
-      if (triaxial) partA = keepSourceSide(partA, axisIdx3, 0, false);
-      parts.push(partA);
-
-      // B: clone, pre-X-flip (matches mirrorBytesB in the live preview),
-      // apply T_B, keep mirror side. Falls back to A's data when B is empty.
-      const worldB = mirrorAllSplats(splatForMirror, 0, 0);
-      applyTransform(
-        worldB,
-        composedMatB.elements,
-        new Float32Array([
-          composedQuatB.x,
-          composedQuatB.y,
-          composedQuatB.z,
-          composedQuatB.w,
-        ]),
-        sB,
-      );
-      let partB = keepMirrorSide(
-        worldB,
-        axisIdx,
-        ui.state.plane,
-        ui.state.flipSide,
-      );
-      if (biaxial) partB = keepSourceSide(partB, axisIdx2, 0, false);
-      if (triaxial) partB = keepSourceSide(partB, axisIdx3, 0, false);
-      parts.push(partB);
-    }
-
-    // Biaxial / triaxial extras. One copy each — these don't get the radial
-    // multiplication in V1 (matches the preview, which also keeps a single
-    // copy of each extra octant regardless of radialCount).
-    //
-    // Helper: bake one octant. `m` is the world matrix to apply (det = +1),
-    // `useXFlip` says whether the splat data should be pre-X-flipped first
-    // (true for odd-parity octants), and `clips` is an array of
-    // [axisIdx, plane, useMirrorSide] entries that intersect the result.
-    function bakeOctant(m, useXFlip, clips) {
+    // Helper: bake one part for one layer.
+    //   `M_world`  = world matrix to apply (det = +1; already includes
+    //                radial rotation + any plane reflections).
+    //   `useXFlip` = pre-X-flip the data first (true for odd-parity compartments).
+    //   `clips`    = list of [axisIdx, plane, useMirrorSide] half-spaces to AND.
+    function bakePart(layer, M_world, useXFlip, clips) {
       const pos = new THREE.Vector3();
       const quat = new THREE.Quaternion();
       const scl = new THREE.Vector3();
-      m.decompose(pos, quat, scl);
+      M_world.decompose(pos, quat, scl);
       const s = (scl.x + scl.y + scl.z) / 3;
-      const src = useXFlip ? splatForMirror : splatA;
-      const world = useXFlip ? mirrorAllSplats(src, 0, 0) : cloneSplatData(src);
+      const world = useXFlip
+        ? mirrorAllSplats(layer.splat, 0, 0)
+        : cloneSplatData(layer.splat);
       applyTransform(
         world,
-        m.elements,
+        M_world.elements,
         new Float32Array([quat.x, quat.y, quat.z, quat.w]),
         s,
       );
@@ -1357,98 +1552,168 @@ async function handleDownload() {
       return part;
     }
 
-    if (biaxial) {
-      // C (+-+): reflection across plane 2 only. 1 minus → X-flipped data.
-      //   M_C = Reflect_world2 · M_A · Reflect_local_X
-      const matC = new THREE.Matrix4()
-        .multiplyMatrices(reflectWorld2, splatGroupA.matrixWorld)
-        .multiply(reflectLocal);
-      const clipsC = [
-        [axisIdx, ui.state.plane, false], // source of P1
-        [axisIdx2, 0, true], // mirror of P2
-      ];
-      if (triaxial) clipsC.push([axisIdx3, 0, false]); // source of P3
-      parts.push(bakeOctant(matC, true, clipsC));
-
-      // D (--+): reflection across BOTH planes 1 and 2. 2 minuses → original data.
-      //   M_D = Reflect_world · Reflect_world2 · M_A
-      const matD = new THREE.Matrix4()
-        .multiplyMatrices(reflectWorld, reflectWorld2)
-        .multiply(splatGroupA.matrixWorld);
-      const clipsD = [
-        [axisIdx, ui.state.plane, true], // mirror of P1
-        [axisIdx2, 0, true], // mirror of P2
-      ];
-      if (triaxial) clipsD.push([axisIdx3, 0, false]); // source of P3
-      parts.push(bakeOctant(matD, false, clipsD));
+    // Build a per-compartment recipe: how to construct the world matrix
+    // (given the layer's group matrix + an optional radial rotation),
+    // whether to use the X-flipped data, and which half-spaces to clip
+    // against. Compartments outside the current mode return `null` so
+    // they're skipped.
+    function compartmentRecipe(compIdx, layer, rotMat) {
+      const G = layer.group.matrixWorld;
+      const biaxial = mode === "biaxial" || mode === "triaxial";
+      const triaxial = mode === "triaxial";
+      const baseClips0 = [[axisIdx, ui.state.plane, false]]; // src of P1
+      const baseClips1 = [[axisIdx, ui.state.plane, true]];  // mirror of P1
+      const addBi = (clips, mirrorOfP2) => {
+        if (biaxial) clips.push([axisIdx2, 0, mirrorOfP2]);
+        return clips;
+      };
+      const addTri = (clips, mirrorOfP3) => {
+        if (triaxial) clips.push([axisIdx3, 0, mirrorOfP3]);
+        return clips;
+      };
+      // Slot clip: hard walls along the secondary axis that match the
+      // per-layer slotSdfSrc / slotSdfMir applied in the live preview.
+      // `mirrorOfP2` flips which side of the secondary plane the slot
+      // sits on (same convention as `addBi`). The slot is centered on
+      // the layer's current secondary-axis position (±, depending on
+      // the compartment's P2 sign) and is one baseLayerExtent wide.
+      const addSlot = (clips, mirrorOfP2) => {
+        if (baseLayerExtent <= 0) return clips;
+        const layerSecPos = layer.group.position.getComponent(axisIdx2);
+        const slotCenter = mirrorOfP2 ? -layerSecPos : layerSecPos;
+        const halfW = baseLayerExtent / 2;
+        clips.push([axisIdx2, slotCenter - halfW, false]); // keep right of left wall
+        clips.push([axisIdx2, slotCenter + halfW, true]);  // keep left of right wall
+        return clips;
+      };
+      const compose = (...mats) => {
+        const out = new THREE.Matrix4().copy(mats[0]);
+        for (let i = 1; i < mats.length; i++) out.multiply(mats[i]);
+        return out;
+      };
+      // Recipe builder: each compartment has signs (s1, s2, s3) for the
+      // primary / secondary / tertiary planes. We call addBi / addTri /
+      // addSlot in that order so the per-layer slot clip always lives at
+      // the END of the clips array (purely cosmetic — they all MULTIPLY).
+      const build = (M, useXFlip, baseClips, s2) => ({
+        M,
+        useXFlip,
+        clips: addSlot(addTri(addBi(baseClips.slice(), s2), false), s2),
+      });
+      switch (compIdx) {
+        case 0: // (+ + +) originalMesh — radial-multiplied
+          return build(compose(rotMat, G), false, baseClips0, false);
+        case 1: // (- + +) mirrorMesh — radial-multiplied
+          return build(
+            compose(rotMat, reflectWorld, G, reflectLocal),
+            true,
+            baseClips1,
+            false,
+          );
+        case 2: // (+ - +) secondaryMesh — biaxial+ only
+          if (!biaxial) return null;
+          return build(
+            compose(reflectWorld2, G, reflectLocal),
+            true,
+            baseClips0,
+            true,
+          );
+        case 3: // (- - +) diagonalMesh — biaxial+ only
+          if (!biaxial) return null;
+          return build(
+            compose(reflectWorld, reflectWorld2, G),
+            false,
+            baseClips1,
+            true,
+          );
+        case 4: // (+ + -) mesh_ppm — triaxial only
+          if (!triaxial) return null;
+          return {
+            M: compose(reflectWorld3, G, reflectLocal),
+            useXFlip: true,
+            clips: addSlot(addTri(addBi(baseClips0.slice(), false), true), false),
+          };
+        case 5: // (- + -) mesh_mpm — triaxial only
+          if (!triaxial) return null;
+          return {
+            M: compose(reflectWorld, reflectWorld3, G),
+            useXFlip: false,
+            clips: addSlot(addTri(addBi(baseClips1.slice(), false), true), false),
+          };
+        case 6: // (+ - -) mesh_pmm — triaxial only
+          if (!triaxial) return null;
+          return {
+            M: compose(reflectWorld2, reflectWorld3, G),
+            useXFlip: false,
+            clips: addSlot(addTri(addBi(baseClips0.slice(), true), true), true),
+          };
+        case 7: // (- - -) mesh_mmm — triaxial only (point inversion)
+          if (!triaxial) return null;
+          return {
+            M: compose(reflectWorld, reflectWorld2, reflectWorld3, G, reflectLocal),
+            useXFlip: true,
+            clips: addSlot(addTri(addBi(baseClips1.slice(), true), true), true),
+          };
+      }
+      return null;
     }
 
-    // Triaxial-only octants: the four that lie on the MIRROR side of plane 3.
-    if (triaxial) {
-      // (++-): reflection across plane 3 only. 1 minus → X-flipped data.
-      //   M = Reflect_world3 · M_A · Reflect_local_X
-      const mat_ppm = new THREE.Matrix4()
-        .multiplyMatrices(reflectWorld3, splatGroupA.matrixWorld)
-        .multiply(reflectLocal);
-      parts.push(
-        bakeOctant(mat_ppm, true, [
-          [axisIdx, ui.state.plane, false], // source of P1
-          [axisIdx2, 0, false], // source of P2
-          [axisIdx3, 0, true], // mirror of P3
-        ]),
-      );
+    const rotMat = new THREE.Matrix4();
+    const rotQuat = new THREE.Quaternion();
 
-      // (-+-): reflection across planes 1 and 3. 2 minuses → original data.
-      //   M = Reflect_world · Reflect_world3 · M_A
-      const mat_mpm = new THREE.Matrix4()
-        .multiplyMatrices(reflectWorld, reflectWorld3)
-        .multiply(splatGroupA.matrixWorld);
-      parts.push(
-        bakeOctant(mat_mpm, false, [
-          [axisIdx, ui.state.plane, true],
-          [axisIdx2, 0, false],
-          [axisIdx3, 0, true],
-        ]),
-      );
+    for (const layer of loaded) {
+      if (!layer.visible) continue; // hidden layers contribute nothing
+      layer.group.updateMatrixWorld(true);
 
-      // (+--): reflection across planes 2 and 3. 2 minuses → original data.
-      //   M = Reflect_world2 · Reflect_world3 · M_A
-      const mat_pmm = new THREE.Matrix4()
-        .multiplyMatrices(reflectWorld2, reflectWorld3)
-        .multiply(splatGroupA.matrixWorld);
-      parts.push(
-        bakeOctant(mat_pmm, false, [
-          [axisIdx, ui.state.plane, false],
-          [axisIdx2, 0, true],
-          [axisIdx3, 0, true],
-        ]),
-      );
+      // Warn once if a layer has non-uniform scale (download approximates it).
+      const sclTmp = new THREE.Vector3();
+      const posTmp = new THREE.Vector3();
+      const quatTmp = new THREE.Quaternion();
+      layer.group.matrixWorld.decompose(posTmp, quatTmp, sclTmp);
+      const scaleSpread =
+        Math.max(sclTmp.x, sclTmp.y, sclTmp.z) /
+        Math.min(sclTmp.x, sclTmp.y, sclTmp.z);
+      if (scaleSpread > 1.001) {
+        ui.setStatus(
+          `Note: non-uniform scale on ${layer.name} — download uses the average.`,
+        );
+      }
 
-      // (---): reflection across all three planes = point inversion through
-      // the origin. 3 minuses → X-flipped data.
-      //   M = Reflect_world · Reflect_world2 · Reflect_world3 · M_A · Reflect_local_X
-      const mat_mmm = new THREE.Matrix4()
-        .multiplyMatrices(reflectWorld, reflectWorld2)
-        .multiply(reflectWorld3)
-        .multiply(splatGroupA.matrixWorld)
-        .multiply(reflectLocal);
-      parts.push(
-        bakeOctant(mat_mmm, true, [
-          [axisIdx, ui.state.plane, true],
-          [axisIdx2, 0, true],
-          [axisIdx3, 0, true],
-        ]),
-      );
+      for (let comp = 0; comp < compCount; comp++) {
+        // Every layer bakes every compartment of the active mode — that
+        // mirrors the live preview, where each layer fully auto-mirrors.
+
+        // Compartments 0 and 1 (primary pair) get the radial multiplication.
+        // The extras (2..7) are baked once — matches the preview, where
+        // radial copies are only spawned for the primary pair.
+        const radialReps = comp <= 1 ? radialCount : 1;
+        for (let i = 0; i < radialReps; i++) {
+          const angle = (i * 2 * Math.PI) / radialCount;
+          rotQuat.setFromAxisAngle(Y_AXIS, angle);
+          rotMat.makeRotationFromQuaternion(rotQuat);
+          // Extras use identity rotation — no radial multiplication, but
+          // we still need a matrix to pass to compose().
+          const r = comp <= 1 ? rotMat : new THREE.Matrix4(); // identity
+          const recipe = compartmentRecipe(comp, layer, r);
+          if (!recipe) continue;
+          parts.push(bakePart(layer, recipe.M, recipe.useXFlip, recipe.clips));
+        }
+      }
     }
 
     const mirroredData = concatSplats(parts);
     const bytes = encodeSpz(mirroredData);
-    const baseName = fileNameA.replace(/\.spz$/i, "");
+    const visibleLoaded = loaded.filter((l) => l.visible);
+    const baseName =
+      visibleLoaded.length === 1
+        ? visibleLoaded[0].fileName.replace(/\.spz$/i, "")
+        : "splat-mirror";
     // Filename suffix reflects what was baked in.
     const suffixBits = [];
-    if (splatB) suffixBits.push("AB");
-    if (triaxial) suffixBits.push("triaxial");
-    else if (biaxial) suffixBits.push("biaxial");
+    if (visibleLoaded.length > 1)
+      suffixBits.push(`${visibleLoaded.length}layers`);
+    if (mode === "triaxial") suffixBits.push("triaxial");
+    else if (mode === "biaxial") suffixBits.push("biaxial");
     if (radialCount > 1) suffixBits.push(`radial${radialCount}`);
     const suffix = suffixBits.length
       ? `-${suffixBits.join("-")}`

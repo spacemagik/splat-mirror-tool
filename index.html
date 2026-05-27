@@ -15,23 +15,16 @@
         <summary>Splats</summary>
         <div class="accordion-body">
           <section class="group">
-            <label class="group-label">Slot A — source side</label>
-            <div class="slot">
-              <span class="slot-name" id="slot-a-name">not loaded</span>
-              <button id="slot-a-load" class="ghost">Load .spz</button>
-              <button id="slot-a-clear" class="ghost" title="Clear slot A">×</button>
+            <div class="layer-list" id="layer-list">
+              <!-- Layer rows are rendered by ui.js renderLayerList(). -->
             </div>
-          </section>
-          <section class="group">
-            <label class="group-label">Slot B — mirror side</label>
-            <div class="slot">
-              <span class="slot-name" id="slot-b-name">not loaded</span>
-              <button id="slot-b-load" class="ghost">Load .spz</button>
-              <button id="slot-b-clear" class="ghost" title="Clear slot B">×</button>
-            </div>
-            <p class="hint">
-              Leave B empty to use A's mirror image. Load a different splat
-              here to replace the reflection with another object.
+            <button id="add-layer-btn" class="ghost full">
+              + Add splat
+            </button>
+            <p class="hint" id="layer-hint">
+              <!-- Content is set by ui.renderLayerList(): "drop here" when no
+                   splats are loaded, an upgrade hint when too many are loaded
+                   for the current mode, otherwise hidden. -->
             </p>
           </section>
           <input id="file-input" type="file" accept=".spz" hidden />
@@ -105,11 +98,13 @@
               <button class="mode-btn" data-mode="scale">Scale</button>
               <button class="mode-btn" data-mode="off">Off</button>
             </div>
-            <div class="axis-buttons target-buttons" role="radiogroup" aria-label="Edit target">
-              <button class="target-btn active" data-target="a">Edit A</button>
-              <button class="target-btn" data-target="b" disabled>Edit B</button>
-            </div>
-            <button id="reset-splat" class="ghost full">Reset splat transform</button>
+            <p class="hint">
+              The gizmo edits whichever layer has the
+              <strong>Edit</strong> dot on it (under Splats above).
+            </p>
+            <button id="reset-splat" class="ghost full">
+              Reset selected layer
+            </button>
           </section>
         </div>
       </details>
@@ -173,19 +168,11 @@
       Download mirrored .spz
     </button>
 
-    <!-- Drag overlay: split into two halves, drop position picks the slot -->
+    <!-- Drag overlay: dropping anywhere adds a new layer (up to 4). -->
     <div id="drop-overlay">
-      <div class="drop-half" data-slot="a">
-        <div class="drop-card">
-          <span class="drop-title">Slot A</span>
-          <span class="drop-sub">source side</span>
-        </div>
-      </div>
-      <div class="drop-half" data-slot="b">
-        <div class="drop-card">
-          <span class="drop-title">Slot B</span>
-          <span class="drop-sub">mirror side</span>
-        </div>
+      <div class="drop-card">
+        <span class="drop-title">Drop to add layer</span>
+        <span class="drop-sub">.spz files only</span>
       </div>
     </div>
 
