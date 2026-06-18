@@ -55,6 +55,94 @@ import {
 } from "@sparkjsdev/spark";
 
 import { createUI } from "./ui.js";
+
+// ----- Save-folder memory (IndexedDB) -----
+// Stores a single directory handle so the user only picks their save folder
+// once — after that every download goes straight there automatically.
+
+const IDB_NAME = "splat-mirror";
+const IDB_STORE = "settings";
+const IDB_KEY = "saveDir";
+
+function openDb() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function getSaveDir() {
+  const db = await openDb();
+  return new Promise((resolve) => {
+    const tx = db.transaction(IDB_STORE, "readonly");
+    const req = tx.objectStore(IDB_STORE).get(IDB_KEY);
+    req.onsuccess = () => resolve(req.result ?? null);
+    req.onerror = () => resolve(null);
+  });
+}
+
+async function setSaveDir(handle) {
+  const db = await openDb();
+  return new Promise((resolve) => {
+    const tx = db.transaction(IDB_STORE, "readwrite");
+    tx.objectStore(IDB_STORE).put(handle, IDB_KEY);
+    tx.oncomplete = resolve;
+  });
+}
+
+// Save bytes to the remembered folder, or fall back to a normal download.
+// First call: asks the user to pick a save folder and remembers it forever.
+async function saveSpzFile(bytes, fileName) {
+  // Try the File System Access API (Chrome / Edge — works on Netlify)
+  if (window.showDirectoryPicker) {
+    let dirHandle = await getSaveDir();
+
+    // Verify we still have write permission; re-prompt if not.
+    if (dirHandle) {
+      const perm = await dirHandle.requestPermission({ mode: "readwrite" });
+      if (perm !== "granted") dirHandle = null;
+    }
+
+    // First time (or permission lost): ask the user to pick a folder.
+    if (!dirHandle) {
+      try {
+        dirHandle = await window.showDirectoryPicker({
+          id: "spz-save",
+          mode: "readwrite",
+          startIn: "downloads",
+        });
+        await setSaveDir(dirHandle);
+      } catch {
+        // User cancelled — fall back to normal download
+        fallbackDownload(bytes, fileName);
+        return;
+      }
+    }
+
+    const fileHandle = await dirHandle.getFileHandle(fileName, { create: true });
+    const writable = await fileHandle.createWritable();
+    await writable.write(bytes);
+    await writable.close();
+    return;
+  }
+
+  // Fallback for browsers without File System Access API (Safari, Firefox)
+  fallbackDownload(bytes, fileName);
+}
+
+function fallbackDownload(bytes, fileName) {
+  const blob = new Blob([bytes], { type: "application/octet-stream" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 import { decodeSpz } from "./spz-decode.js";
 import { encodeSpz } from "./spz-encode.js";
 import {
@@ -1719,16 +1807,7 @@ async function handleDownload() {
       ? `-${suffixBits.join("-")}`
       : "-mirrored";
     const downloadName = `${baseName}${suffix}.spz`;
-    const blob = new Blob([bytes], { type: "application/octet-stream" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = downloadName;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-
+    await saveSpzFile(bytes, downloadName);
     ui.setStatus(
       `Saved ${downloadName} (${mirroredData.numPoints.toLocaleString()} splats)`,
     );
