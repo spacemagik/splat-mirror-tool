@@ -1466,9 +1466,16 @@ function syncLayerUI() {
 // because they're inherently low-priority.
 function applyActiveLayerSHRule() {
   for (const layer of layers) {
-    const cap = layer.id === activeLayerId ? Infinity : 0;
-    for (const key of COMPARTMENT_MESH_KEY) {
-      if (layer[key]) layer[key].maxSh = cap;
+    const isActive = layer.id === activeLayerId;
+    for (let i = 0; i < COMPARTMENT_MESH_KEY.length; i++) {
+      const mesh = layer[COMPARTMENT_MESH_KEY[i]];
+      if (!mesh) continue;
+      // Full SH only on the primary SOURCE mesh of the active layer.
+      // Mirror/octant meshes always use maxSh=0 (flat base color) because
+      // their world matrix contains an improper rotation (scale -1 on one
+      // axis) that Spark's SH shader can't decompose correctly, producing
+      // spiky view-dependent artifacts on the reflected side.
+      mesh.maxSh = (isActive && i === 0) ? Infinity : 0;
     }
   }
 }
