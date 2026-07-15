@@ -2,7 +2,7 @@
 
 A browser-based tool for mirroring [Gaussian splat](https://en.wikipedia.org/wiki/Gaussian_splatting) scenes in real time. Drop in a `.spz` file, position the mirror plane, and export a new `.spz` that matches exactly what you see in the preview.
 
-**[Try it live →](https://spacemagik.github.io/spzmirror/)**
+**[Try it live →](https://spzmirror.netlify.app)** (also mirrored on [GitHub Pages](https://spacemagik.github.io/spzmirror/))
 
 ---
 

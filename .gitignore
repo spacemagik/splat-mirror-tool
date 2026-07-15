@@ -16,3 +16,6 @@ dist/
 # Block .spz files everywhere except the default splat in public/
 *.spz
 !public/*.spz
+
+# Local Netlify folder
+.netlify
